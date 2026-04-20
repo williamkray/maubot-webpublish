@@ -158,12 +158,17 @@ def render_body(msg: dict, homeserver_url: str, proxy_base_url: str = "") -> str
 
     if msgtype == "m.image":
         url = mxc_to_http(msg.get("media_url", ""), homeserver_url, proxy_base_url)
-        alt = escape(msg.get("body", "image"))
+        body_text = msg.get("body", "")
+        alt = escape(body_text or "image")
+        # Show body as caption if it looks like prose rather than a bare filename
+        # (filenames have no spaces and end in a file extension)
+        is_filename = bool(re.fullmatch(r'[^\s]+\.[a-zA-Z0-9]{2,5}', body_text or ""))
+        caption = "" if is_filename else escape(body_text)
         if url:
-            return (
-                f'<img class="webpublish-media" src="{escape(url)}" '
-                f'alt="{alt}" loading="lazy">'
-            )
+            img = f'<img class="webpublish-media" src="{escape(url)}" alt="{alt}" loading="lazy">'
+            if caption:
+                return f'<figure class="webpublish-figure">{img}<figcaption>{caption}</figcaption></figure>'
+            return img
         return f"[image: {alt}]"
 
     if msgtype == "m.file":
@@ -403,6 +408,8 @@ a:hover { text-decoration: underline; }
 .webpublish-body img.webpublish-media {
   max-width: 400px; max-height: 300px; border-radius: 8px; margin: 4px 0;
 }
+.webpublish-figure { display: inline-block; margin: 4px 0; }
+.webpublish-figure figcaption { font-size: 0.85em; color: var(--text-muted); margin-top: 4px; }
 .webpublish-body pre {
   background: var(--bg); padding: 12px; border-radius: 6px; overflow-x: auto; margin: 4px 0;
 }
