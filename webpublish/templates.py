@@ -505,6 +505,28 @@ def _page_head(title: str, custom_css: str) -> str:
     )
 
 
+_LOCALIZE_TIMESTAMPS_SCRIPT = (
+    '<script>\n'
+    '(function() {\n'
+    '  function localizeTimestamps(root) {\n'
+    '    (root || document).querySelectorAll("time.webpublish-timestamp").forEach(function(el) {\n'
+    '      var iso = el.getAttribute("datetime");\n'
+    '      if (!iso) return;\n'
+    '      var d = new Date(iso);\n'
+    '      if (isNaN(d)) return;\n'
+    '      el.textContent = d.toLocaleString(undefined, {\n'
+    '        year: "numeric", month: "short", day: "numeric",\n'
+    '        hour: "2-digit", minute: "2-digit"\n'
+    '      });\n'
+    '    });\n'
+    '  }\n'
+    '  localizeTimestamps();\n'
+    '  window._wpLocalizeTimestamps = localizeTimestamps;\n'
+    '})();\n'
+    '</script>'
+)
+
+
 def _sse_chat_script(encoded_alias: str) -> str:
     sse_url = f"{encoded_alias}/sse"
     return (
@@ -521,6 +543,7 @@ def _sse_chat_script(encoded_alias: str) -> str:
         '    var d = JSON.parse(e.data);\n'
         '    var near = isNearBottom();\n'
         '    msgs.insertAdjacentHTML("beforeend", d.html);\n'
+        '    if (window._wpLocalizeTimestamps) window._wpLocalizeTimestamps(msgs.lastElementChild);\n'
         '    if (near) scrollBottom();\n'
         '  });\n'
         '  src.addEventListener("edit_message", function(e) {\n'
@@ -577,7 +600,10 @@ def _sse_post_detail_script(post_event_id: str) -> str:
         '    var d = JSON.parse(e.data);\n'
         f'    if (d.thread_root !== "{escape(post_event_id)}") return;\n'
         '    var el = document.getElementById("comments");\n'
-        '    if (el) el.insertAdjacentHTML("beforeend", d.html);\n'
+        '    if (el) {\n'
+        '      el.insertAdjacentHTML("beforeend", d.html);\n'
+        '      if (window._wpLocalizeTimestamps) window._wpLocalizeTimestamps(el.lastElementChild);\n'
+        '    }\n'
         '  });\n'
         '  src.addEventListener("edit_message", function(e) {\n'
         '    var d = JSON.parse(e.data);\n'
@@ -622,7 +648,7 @@ def render_chat_page(
         f'</header>\n'
         f'<main class="webpublish-chat">\n'
         f'  <div class="webpublish-messages" id="messages">\n{msgs_html}\n  </div>\n'
-        f'</main>\n{sse}\n</body>\n</html>'
+        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{sse}\n</body>\n</html>'
     )
 
 
@@ -666,7 +692,7 @@ def render_journal_landing(
         f'<main class="webpublish-journal">\n'
         f'  <div class="webpublish-posts">\n{posts_html}\n  </div>\n'
         f'  {pag_html}\n'
-        f'</main>\n{sse}\n</body>\n</html>'
+        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{sse}\n</body>\n</html>'
     )
 
 
@@ -716,5 +742,5 @@ def render_journal_post(
         f'    <h2>{label}</h2>\n'
         f'    <div id="comments">\n{comments_html}\n    </div>\n'
         f'  </section>\n'
-        f'</main>\n{sse}\n</body>\n</html>'
+        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{sse}\n</body>\n</html>'
     )
