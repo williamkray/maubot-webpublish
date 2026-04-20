@@ -1,0 +1,5 @@
+*.pyc
+__pycache__/
+*.mbp
+data/config.yaml
+data/*.db

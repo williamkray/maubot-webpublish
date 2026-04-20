@@ -1,0 +1,20 @@
+# Styling for the web view. Options:
+#   1. Leave empty — uses the built-in system theme (auto light/dark via OS preference)
+#   2. Import a named built-in theme (replace PLUGIN_URL with your plugin's base URL):
+#        @import url("PLUGIN_URL/theme/dark.css");
+#      Available themes: light, dark, catppuccin-light, catppuccin-dark,
+#                        gruvbox, solarized-light, solarized-dark
+#   3. Write raw CSS to override variables or add custom rules:
+#        :root { --accent: #ff6b6b; }
+css: ""
+# Number of entries per page in journal mode
+pagination: 10
+# Maximum number of messages to backfill when publishing a room
+max_backfill: 1000
+# Minimum power level required to publish/disable rooms (100 = room admin)
+min_power_level: 100
+# Minimum power level required to post top-level entries in journal rooms (ignored for chat rooms)
+journal_author_pl: 50
+# Base URL for the web interface (leave empty to auto-detect from maubot)
+# Example: https://your.maubot.host/_matrix/maubot/plugin/your-instance-id
+base_url: ""

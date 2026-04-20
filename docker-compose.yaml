@@ -1,0 +1,19 @@
+services:
+  bot:
+    image: dock.mau.dev/maubot/maubot:standalone
+    command:
+      - python3
+      - -m
+      - maubot.standalone
+      - -m
+      - /opt/webpublish/maubot.yaml
+      - -c
+      - /data/config.yaml
+      - -b
+      - /opt/webpublish/example-standalone-config.yaml
+    volumes:
+      - ./:/opt/webpublish:ro
+      - ./data:/data
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

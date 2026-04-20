@@ -1,0 +1,90 @@
+# Save a copy of this as config.yaml and adjust to your liking.
+# Bot account details
+user:
+    credentials:
+        id: "@webpublish:example.com"
+        homeserver: https://example.com
+        access_token: YOUR_ACCESS_TOKEN_HERE
+        # Set the device ID matching your access token to enable encryption.
+        device_id: null
+    # Enable /sync to receive messages
+    sync: true
+    # Not an appservice
+    appservice: false
+    hs_token: null
+    # Automatically accept invites to rooms
+    autojoin: true
+    # Set to "disable" to leave the bot's current displayname/avatar unchanged
+    displayname: "WebPublish"
+    avatar_url: disable
+
+    # Ignore messages from before the bot started (recommended)
+    ignore_initial_sync: true
+    ignore_first_sync: true
+
+# Web server settings — required because this plugin serves a public web UI
+server:
+    hostname: 0.0.0.0
+    port: 8080
+    # The base path where the plugin's web resources will be served.
+    # In standalone mode this defaults to /, which means the web UI is
+    # available directly at the public URL below.
+    base_path: /
+    # The public URL where the web UI is reachable by browsers.
+    # This is used to generate links the bot posts into Matrix rooms.
+    public_url: https://example.com
+
+database: sqlite:/data/bot.db
+
+database_opts:
+    min_size: 1
+    max_size: 10
+
+# Plugin configuration — see base-config.yaml for all options and documentation
+plugin_config:
+    # Custom CSS for the web UI.
+    # Leave empty to use the built-in system theme (auto light/dark via OS preference).
+    # To use a built-in named theme, uncomment one of the lines below and replace
+    # PLUGIN_URL with your public_url above (e.g. https://example.com):
+    #   @import url("PLUGIN_URL/theme/dark.css");
+    # Available themes: light, dark, catppuccin-light, catppuccin-dark,
+    #                   gruvbox, solarized-light, solarized-dark
+    css: ""
+
+    # Number of posts per page in journal mode
+    pagination: 10
+
+    # Maximum number of messages to backfill when a room is first published
+    max_backfill: 1000
+
+    # Minimum Matrix power level required to run !webpublish commands (100 = room admin)
+    min_power_level: 100
+
+    # Minimum power level to post top-level entries in journal rooms (ignored for chat rooms)
+    journal_author_pl: 50
+
+    # Override the public base URL used for web links posted into rooms.
+    # Leave empty to auto-detect from the server.public_url above.
+    base_url: ""
+
+# Standard Python logging configuration
+logging:
+    version: 1
+    formatters:
+        colored:
+            (): maubot.lib.color_log.ColorFormatter
+            format: "[%(asctime)s] [%(levelname)s@%(name)s] %(message)s"
+    handlers:
+        console:
+            class: logging.StreamHandler
+            formatter: colored
+    loggers:
+        maubot:
+            level: DEBUG
+        mau:
+            level: DEBUG
+        aiohttp:
+            level: INFO
+    root:
+        level: DEBUG
+        handlers: [console]
