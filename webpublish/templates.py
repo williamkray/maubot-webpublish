@@ -166,9 +166,10 @@ def render_body(msg: dict, homeserver_url: str, proxy_base_url: str = "") -> str
         caption = "" if is_filename else escape(body_text)
         if url:
             img = f'<img class="webpublish-media" src="{escape(url)}" alt="{alt}" loading="lazy">'
+            linked = f'<a href="{escape(url)}" target="_blank" rel="noopener">{img}</a>'
             if caption:
-                return f'<figure class="webpublish-figure">{img}<figcaption>{caption}</figcaption></figure>'
-            return img
+                return f'<figure class="webpublish-figure">{linked}<figcaption>{caption}</figcaption></figure>'
+            return linked
         return f"[image: {alt}]"
 
     if msgtype == "m.file":
