@@ -54,6 +54,7 @@ class WebPublishBot(Plugin):
         self._backfilling: set[str] = set()
         self._media_cache: OrderedDict[str, tuple[str, bytes]] = OrderedDict()
         self._media_cache_max: int = 100
+        self._room_create_cache: dict[str, tuple[int, set[str]]] = {}
         await self._load_published_rooms()
 
     async def stop(self) -> None:
@@ -226,16 +227,75 @@ class WebPublishBot(Plugin):
         except Exception:
             return ""
 
+    async def _get_room_create_info(self, room_id: str) -> tuple[int, set[str]]:
+        """Return (room_version, set_of_creator_mxids) for the room, cached."""
+        if room_id in self._room_create_cache:
+            return self._room_create_cache[room_id]
+
+        result: tuple[int, set[str]] = (1, set())
+        try:
+            create_content = await self.client.get_state_event(
+                room_id, EventType.ROOM_CREATE
+            )
+            ver_str = getattr(create_content, "room_version", None) or "1"
+            try:
+                room_version = int(ver_str)
+            except (ValueError, TypeError):
+                room_version = 1
+
+            creators: set[str] = set()
+
+            # Primary creator field (present in v1–v10 and v12+)
+            creator = getattr(create_content, "creator", None)
+            if creator:
+                creators.add(str(creator))
+
+            # additional_creators introduced in v12
+            for ac in (getattr(create_content, "additional_creators", None) or []):
+                creators.add(str(ac))
+
+            # If creator field is absent (removed in v11), fall back to the event sender
+            if not creators:
+                all_state = await self.client.api.request(
+                    Method.GET, Path.v3.rooms[room_id].state
+                )
+                for evt_raw in (all_state if isinstance(all_state, list) else []):
+                    if (
+                        evt_raw.get("type") == "m.room.create"
+                        and evt_raw.get("state_key") == ""
+                    ):
+                        sender = evt_raw.get("sender")
+                        if sender:
+                            creators.add(sender)
+                        break
+
+            result = (room_version, creators)
+        except Exception:
+            pass
+
+        self._room_create_cache[room_id] = result
+        return result
+
+    async def _get_effective_power_level(self, room_id: str, user_id: str) -> int:
+        """Return the user's power level, granting implicit infinite power to v12+ creators."""
+        try:
+            levels = await self.client.get_state_event(
+                room_id, EventType.ROOM_POWER_LEVELS
+            )
+            user_level = levels.get_user_level(user_id)
+        except Exception:
+            user_level = 0
+
+        room_version, creators = await self._get_room_create_info(room_id)
+        if room_version >= 12 and str(user_id) in creators:
+            return 2**31 - 1  # effectively infinite per Matrix room v12 spec
+
+        return user_level
+
     async def _check_power_level(self, evt: MessageEvent) -> bool:
         """Return True if the sender meets the configured min_power_level."""
         required = self.config["min_power_level"]
-        try:
-            levels = await self.client.get_state_event(
-                evt.room_id, EventType.ROOM_POWER_LEVELS
-            )
-            user_level = levels.get_user_level(evt.sender)
-        except Exception:
-            user_level = 0
+        user_level = await self._get_effective_power_level(evt.room_id, str(evt.sender))
         if user_level < required:
             await evt.reply(
                 f"You need a power level of at least {required} to use this command."
@@ -527,13 +587,9 @@ class WebPublishBot(Plugin):
         info = self._published[evt.room_id]
         if info["mode"] == "journal" and thread_root is None:
             author_pl = self.config["journal_author_pl"]
-            try:
-                levels = await self.client.get_state_event(
-                    evt.room_id, EventType.ROOM_POWER_LEVELS
-                )
-                user_level = levels.get_user_level(evt.sender)
-            except Exception:
-                user_level = 0
+            user_level = await self._get_effective_power_level(
+                evt.room_id, str(evt.sender)
+            )
             if user_level < author_pl:
                 try:
                     await self.client.redact(
