@@ -490,6 +490,7 @@ a:hover { text-decoration: underline; }
   margin: 24px 0; line-height: 1.7; text-align: justify; hyphens: auto;
 }
 .webpublish-post-full .webpublish-post-body img { max-width: 100%; border-radius: 8px; }
+.webpublish-post-full .webpublish-post-body p + p { margin-top: 1em; }
 .webpublish-post-full .webpublish-post-body pre {
   background: var(--bg); padding: 16px; border-radius: 6px; overflow-x: auto;
 }
