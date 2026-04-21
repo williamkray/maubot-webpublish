@@ -670,14 +670,13 @@ class WebPublishBot(Plugin):
 
         if rel_type == "m.replace":
             target_id = str(relates.event_id)
-            new_content = content.get("m.new_content") or {}
-            new_body = new_content.get("body", body)
-            new_fmt = new_content.get("formatted_body")
+            new_body = content.body or body
+            new_fmt = getattr(content, "formatted_body", None)
             await self._update_message_edit(target_id, new_body, new_fmt)
 
             body_html = render_body(
                 {"body": new_body, "formatted_body": new_fmt, "redacted": False,
-                 "msgtype": new_content.get("msgtype", "m.text")},
+                 "msgtype": str(content.msgtype or "m.text")},
                 self._homeserver_url(),
                 self._base_url,
             )
