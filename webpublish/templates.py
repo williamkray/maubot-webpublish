@@ -836,6 +836,7 @@ def render_journal_post(
     count = len(comments)
     label = f"{count} comment{'s' if count != 1 else ''}" if count else "No comments yet"
 
+    matrix_link = f"https://matrix.to/#/{quote(post['room_id'])}/{quote(post['event_id'])}"
     sse = _sse_post_detail_script(post["event_id"])
     leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
     scroll_script = _scroll_header_script()
@@ -854,6 +855,9 @@ def render_journal_post(
         f'    </div>\n'
         f'    <div class="webpublish-post-body">{body_html}</div>\n'
         f'  </article>\n'
+        f'  <div class="webpublish-matrix-reply-link">\n'
+        f'    <a href="{matrix_link}" target="_blank" rel="noopener noreferrer">Reply in Matrix</a>\n'
+        f'  </div>\n'
         f'  <section class="webpublish-comments">\n'
         f'    <h2>{label}</h2>\n'
         f'    <div id="comments">\n{comments_html}\n    </div>\n'
