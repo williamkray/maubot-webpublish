@@ -481,6 +481,8 @@ class WebPublishBot(Plugin):
                 for raw in chunk:
                     if raw.get("type") != "m.room.message":
                         continue
+                    if raw.get("unsigned", {}).get("redacted_because"):
+                        continue
                     c = raw.get("content", {})
                     relates = c.get("m.relates_to") or {}
 
