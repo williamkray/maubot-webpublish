@@ -673,8 +673,6 @@ def _sse_post_detail_script(post_event_id: str) -> str:
         '    var el = document.getElementById(d.element_id);\n'
         '    if (el) el.remove();\n'
         '  });\n'
-        '  var link = document.querySelector(".webpublish-back-link");\n'
-        '  if (link) link.href = base;\n'
         '})();\n'
         '</script>'
     )
@@ -787,7 +785,7 @@ def render_journal_post(
 
     sse = _sse_post_detail_script(post["event_id"])
     leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
-    back_href = f"{proxy_base_url}/{encoded_alias}" if encoded_alias else f"{proxy_base_url}/"
+    back_href = "../" if not encoded_alias else f"../../{encoded_alias}"
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'

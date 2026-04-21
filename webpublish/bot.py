@@ -408,7 +408,7 @@ class WebPublishBot(Plugin):
             await evt.reply("This room is not published.")
             return
         alias = info["alias"]
-        url = f"{self._base_url}/" if not alias else f"{self._base_url}/{quote(alias, safe='')}"
+        url = f"{self._base_url}/" if alias == "/" else f"{self._base_url}/{quote(alias, safe='')}"
         await evt.reply(f"Published ({info['mode']} mode): {url}")
 
     @webpublish.subcommand("seturi", help="Override the URI path for this room's published site")
@@ -422,7 +422,7 @@ class WebPublishBot(Plugin):
             return
         uri = uri.strip()
         if uri == "/":
-            alias = ""
+            alias = "/"
         else:
             alias = uri.strip("/")
             if not re.match(r'^[a-zA-Z0-9_\-]+$', alias):
@@ -433,7 +433,7 @@ class WebPublishBot(Plugin):
             await evt.reply("That URI is already in use by another room.")
             return
         await self._set_published(evt.room_id, info["mode"], alias)
-        url = f"{self._base_url}/" if not alias else f"{self._base_url}/{quote(alias, safe='')}"
+        url = f"{self._base_url}/" if alias == "/" else f"{self._base_url}/{quote(alias, safe='')}"
         await evt.reply(f"URI updated! Site now available at {url}")
 
     async def _publish_room(self, evt: MessageEvent, mode: str) -> None:
@@ -838,7 +838,7 @@ class WebPublishBot(Plugin):
 
     @web.get("/")
     async def web_main_root(self, req: Request) -> Response:
-        return await self._handle_main(req, "")
+        return await self._handle_main(req, "/")
 
     async def _handle_main(self, req: Request, alias: str) -> Response:
         room_id = self._alias_to_room.get(alias)
@@ -846,11 +846,11 @@ class WebPublishBot(Plugin):
             return Response(status=404, text="Room not found")
 
         info = self._published[room_id]
-        room_name = await self._get_room_name(room_id) or alias
+        room_name = await self._get_room_name(room_id) or (alias if alias != "/" else "")
         room_topic = await self._get_room_topic(room_id)
         hs = self._homeserver_url()
         css = self.config["css"]
-        encoded = quote(alias, safe="")
+        encoded = "" if alias == "/" else quote(alias, safe="")
 
         if info["mode"] == "chat":
             messages = await self._get_messages(room_id, limit=200)
@@ -879,7 +879,7 @@ class WebPublishBot(Plugin):
 
     @web.get("/post/{event_id}")
     async def web_post_detail_root(self, req: Request) -> Response:
-        return await self._handle_post_detail(req, "", unquote(req.match_info["event_id"]))
+        return await self._handle_post_detail(req, "/", unquote(req.match_info["event_id"]))
 
     async def _handle_post_detail(self, req: Request, alias: str, event_id: str) -> Response:
         room_id = self._alias_to_room.get(alias)
@@ -892,10 +892,10 @@ class WebPublishBot(Plugin):
 
         comments = await self._get_thread_comments(event_id)
         await self._enrich_reply_context(comments)
-        room_name = await self._get_room_name(room_id) or alias
+        room_name = await self._get_room_name(room_id) or (alias if alias != "/" else "")
         hs = self._homeserver_url()
         css = self.config["css"]
-        encoded = quote(alias, safe="")
+        encoded = "" if alias == "/" else quote(alias, safe="")
 
         html = render_journal_post(
             room_name, post, comments, encoded, css, hs, self._base_url,
@@ -908,7 +908,7 @@ class WebPublishBot(Plugin):
 
     @web.get("/sse")
     async def web_sse_root(self, req: Request) -> StreamResponse:
-        return await self._handle_sse(req, "")
+        return await self._handle_sse(req, "/")
 
     async def _handle_sse(self, req: Request, alias: str) -> StreamResponse:
         room_id = self._alias_to_room.get(alias)
