@@ -487,7 +487,7 @@ a:hover { text-decoration: underline; }
 /* journal post detail */
 .webpublish-post-full { max-width: 800px; margin: 0 auto; padding: 24px; }
 .webpublish-post-full .webpublish-post-body {
-  margin: 24px 0; line-height: 1.7;
+  margin: 24px 0; line-height: 1.7; text-align: justify; hyphens: auto;
 }
 .webpublish-post-full .webpublish-post-body img { max-width: 100%; border-radius: 8px; }
 .webpublish-post-full .webpublish-post-body pre {
