@@ -527,6 +527,7 @@ class WebPublishBot(Plugin):
             and self.config["journal_emoji_publish"]
         )
         pending_reactions: list[tuple[str, str]] = []  # (sender, target_event_id)
+        pending_edits: dict[str, tuple[str, str | None]] = {}  # target_event_id -> (body, formatted_body)
 
         try:
             while total < max_msgs:
@@ -563,8 +564,14 @@ class WebPublishBot(Plugin):
                     c = raw.get("content", {})
                     relates = c.get("m.relates_to") or {}
 
-                    # skip edits (originals already present)
                     if relates.get("rel_type") == "m.replace":
+                        target_event_id = relates.get("event_id", "")
+                        if target_event_id and target_event_id not in pending_edits:
+                            new_content = c.get("m.new_content") or {}
+                            pending_edits[target_event_id] = (
+                                new_content.get("body", ""),
+                                new_content.get("formatted_body"),
+                            )
                         continue
                     # skip bot messages
                     sender = raw.get("sender", "")
@@ -629,6 +636,10 @@ class WebPublishBot(Plugin):
                     if not post or post["room_id"] != room_id or post["thread_root"] is not None:
                         continue
                     await self._publish_post(target_id)
+
+            if pending_edits:
+                for target_event_id, (new_body, new_formatted_body) in pending_edits.items():
+                    await self._update_message_edit(target_event_id, new_body, new_formatted_body)
 
             self.log.info(f"Backfill complete for {room_id}: {total} messages stored")
         except Exception as e:
