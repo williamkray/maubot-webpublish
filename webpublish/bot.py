@@ -412,6 +412,20 @@ class WebPublishBot(Plugin):
             return
         await self._publish_room(evt, "journal")
 
+    @webpublish.subcommand(help="Wipe stored messages and re-backfill from scratch")
+    async def rebuild(self, evt: MessageEvent) -> None:
+        if not await self._check_power_level(evt):
+            return
+        if evt.room_id not in self._published:
+            await evt.reply("This room is not currently published.")
+            return
+        if evt.room_id in self._backfilling:
+            await evt.reply("A backfill is already in progress for this room.")
+            return
+        await self.database.execute("DELETE FROM messages WHERE room_id = $1", evt.room_id)
+        await evt.reply("Message history cleared. Rebuilding from scratch…")
+        asyncio.create_task(self._backfill_room(evt.room_id))
+
     @webpublish.subcommand(help="Stop publishing this room")
     async def disable(self, evt: MessageEvent) -> None:
         if not await self._check_power_level(evt):
