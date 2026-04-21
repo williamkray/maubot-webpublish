@@ -850,7 +850,7 @@ class WebPublishBot(Plugin):
         room_topic = await self._get_room_topic(room_id)
         hs = self._homeserver_url()
         css = self.config["css"]
-        encoded = self._base_url if not alias else quote(alias, safe="")
+        encoded = quote(alias, safe="")
 
         if info["mode"] == "chat":
             messages = await self._get_messages(room_id, limit=200)
@@ -895,7 +895,7 @@ class WebPublishBot(Plugin):
         room_name = await self._get_room_name(room_id) or alias
         hs = self._homeserver_url()
         css = self.config["css"]
-        encoded = self._base_url if not alias else quote(alias, safe="")
+        encoded = quote(alias, safe="")
 
         html = render_journal_post(
             room_name, post, comments, encoded, css, hs, self._base_url,

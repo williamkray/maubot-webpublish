@@ -268,7 +268,7 @@ def render_post_preview_html(post: dict, alias: str, comment_count: int) -> str:
         comments_text = f"{comment_count} comment{'s' if comment_count != 1 else ''}"
     else:
         comments_text = "no comments"
-    post_url = f"{alias}/post/{quote(post['event_id'], safe='')}"
+    post_url = f"post/{quote(post['event_id'], safe='')}" if not alias else f"{alias}/post/{quote(post['event_id'], safe='')}"
 
     return (
         f'<article class="webpublish-post-preview" id="{eid}">\n'
@@ -582,7 +582,7 @@ _LOCALIZE_TIMESTAMPS_SCRIPT = (
 
 
 def _sse_chat_script(encoded_alias: str) -> str:
-    sse_url = f"{encoded_alias}/sse"
+    sse_url = "sse" if not encoded_alias else f"{encoded_alias}/sse"
     return (
         '<script>\n'
         '(function() {\n'
@@ -624,7 +624,7 @@ def _sse_chat_script(encoded_alias: str) -> str:
 
 
 def _sse_journal_landing_script(encoded_alias: str) -> str:
-    sse_url = f"{encoded_alias}/sse"
+    sse_url = "sse" if not encoded_alias else f"{encoded_alias}/sse"
     return (
         '<script>\n'
         '(function() {\n'
@@ -787,13 +787,14 @@ def render_journal_post(
 
     sse = _sse_post_detail_script(post["event_id"])
     leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
+    back_href = f"{proxy_base_url}/{encoded_alias}" if encoded_alias else f"{proxy_base_url}/"
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
         f'  <h1>{escape(room_name)}</h1>\n'
         f'</header>\n'
         f'<main class="webpublish-post-full">\n'
-        f'  <a class="webpublish-back-link" href="#">&larr; back to posts</a>\n'
+        f'  <a class="webpublish-back-link" href="{back_href}">&larr; back to posts</a>\n'
         f'  <article>\n'
         f'    <div class="webpublish-post-meta">\n'
         f'      <span>{author}</span>\n'
