@@ -34,6 +34,8 @@ class Config(BaseProxyConfig):
         helper.copy("base_url")
         helper.copy("min_power_level")
         helper.copy("journal_author_pl")
+        helper.copy("journal_emoji_publish")
+        helper.copy("journal_enforce_messages")
 
 
 class WebPublishBot(Plugin):
@@ -107,15 +109,18 @@ class WebPublishBot(Plugin):
         body: str, formatted_body: str | None, msgtype: str,
         media_url: str | None, timestamp: int, thread_root: str | None,
         reply_to: str | None = None, geo_uri: str | None = None,
+        published: bool = True,
     ) -> None:
         await self.database.execute(
             "INSERT INTO messages "
             "(event_id, room_id, sender, sender_name, body, formatted_body, "
-            "msgtype, media_url, timestamp, thread_root, reply_to, geo_uri, edited, redacted) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,FALSE,FALSE) "
+            "msgtype, media_url, timestamp, thread_root, reply_to, geo_uri, "
+            "edited, redacted, published) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,FALSE,FALSE,$13) "
             "ON CONFLICT (event_id) DO NOTHING",
             event_id, room_id, sender, sender_name, body, formatted_body,
             msgtype, media_url, timestamp, thread_root, reply_to, geo_uri,
+            published,
         )
 
     async def _update_message_edit(
@@ -147,14 +152,14 @@ class WebPublishBot(Plugin):
     ) -> tuple[list[dict], int]:
         total = await self.database.fetchval(
             "SELECT COUNT(*) FROM messages "
-            "WHERE room_id=$1 AND thread_root IS NULL AND redacted=FALSE",
+            "WHERE room_id=$1 AND thread_root IS NULL AND redacted=FALSE AND published=TRUE",
             room_id,
         ) or 0
         total_pages = max(1, (total + per_page - 1) // per_page)
         offset = (page - 1) * per_page
         rows = await self.database.fetch(
             "SELECT * FROM messages "
-            "WHERE room_id=$1 AND thread_root IS NULL AND redacted=FALSE "
+            "WHERE room_id=$1 AND thread_root IS NULL AND redacted=FALSE AND published=TRUE "
             "ORDER BY timestamp DESC LIMIT $2 OFFSET $3",
             room_id, per_page, offset,
         )
@@ -173,10 +178,22 @@ class WebPublishBot(Plugin):
 
     async def _get_post(self, event_id: str) -> dict | None:
         row = await self.database.fetchrow(
+            "SELECT * FROM messages WHERE event_id=$1 AND redacted=FALSE AND published=TRUE",
+            event_id,
+        )
+        return dict(row) if row else None
+
+    async def _get_post_internal(self, event_id: str) -> dict | None:
+        row = await self.database.fetchrow(
             "SELECT * FROM messages WHERE event_id=$1 AND redacted=FALSE",
             event_id,
         )
         return dict(row) if row else None
+
+    async def _publish_post(self, event_id: str) -> None:
+        await self.database.execute(
+            "UPDATE messages SET published=TRUE WHERE event_id=$1", event_id
+        )
 
     async def _get_thread_comments(self, thread_root: str) -> list[dict]:
         rows = await self.database.fetch(
@@ -579,8 +596,6 @@ class WebPublishBot(Plugin):
     async def handle_message(self, evt: MessageEvent) -> None:
         if evt.room_id not in self._published:
             return
-        if evt.sender == self.client.mxid:
-            return
 
         content = evt.content
         body = content.body or ""
@@ -628,24 +643,27 @@ class WebPublishBot(Plugin):
         # --- journal author check ---
         info = self._published[evt.room_id]
         if info["mode"] == "journal" and thread_root is None:
-            author_pl = self.config["journal_author_pl"]
-            user_level = await self._get_effective_power_level(
-                evt.room_id, str(evt.sender)
-            )
-            if user_level < author_pl:
-                try:
-                    await self.client.redact(
-                        evt.room_id, evt.event_id,
-                        reason="Non-author top-level message in journal room",
-                    )
-                except Exception:
-                    await evt.reply(
-                        "This message was not published to the journal site because "
-                        "you are not an author of this journal (requires power level "
-                        f"{author_pl}). It should be redacted, but the bot lacks "
-                        "permission to do so — please redact it manually."
-                    )
+            if str(content.msgtype) == "m.notice":
                 return
+            if self.config["journal_enforce_messages"]:
+                author_pl = self.config["journal_author_pl"]
+                user_level = await self._get_effective_power_level(
+                    evt.room_id, str(evt.sender)
+                )
+                if user_level < author_pl:
+                    try:
+                        await self.client.redact(
+                            evt.room_id, evt.event_id,
+                            reason="Non-author top-level message in journal room",
+                        )
+                    except Exception:
+                        await evt.reply(
+                            "This message was not published to the journal site because "
+                            "you are not an author of this journal (requires power level "
+                            f"{author_pl}). It should be redacted, but the bot lacks "
+                            "permission to do so — please redact it manually."
+                        )
+                    return
 
         sender_name = await self._get_sender_name(evt.room_id, str(evt.sender))
         msgtype = str(content.msgtype) if content.msgtype else "m.text"
@@ -664,6 +682,12 @@ class WebPublishBot(Plugin):
             if geo_uri:
                 geo_uri = str(geo_uri)
 
+        published = not (
+            info["mode"] == "journal"
+            and thread_root is None
+            and self.config["journal_emoji_publish"]
+        )
+
         await self._store_message(
             room_id=evt.room_id,
             event_id=str(evt.event_id),
@@ -677,6 +701,7 @@ class WebPublishBot(Plugin):
             thread_root=thread_root,
             reply_to=reply_to,
             geo_uri=geo_uri,
+            published=published,
         )
 
         # SSE notification
@@ -713,7 +738,7 @@ class WebPublishBot(Plugin):
                     "thread_root": thread_root,
                     "event_id": str(evt.event_id),
                 })
-            else:
+            elif published:
                 encoded = quote(info["alias"], safe="")
                 html = render_post_preview_html(msg_dict, encoded, 0)
                 self._notify_sse(evt.room_id, "new_message", {
@@ -736,6 +761,49 @@ class WebPublishBot(Plugin):
         await self._mark_redacted(redacted_id)
         self._notify_sse(evt.room_id, "redact_message", {
             "element_id": safe_element_id(redacted_id),
+        })
+
+    @event.on(EventType.REACTION)
+    async def handle_reaction(self, evt: MessageEvent) -> None:
+        if evt.room_id not in self._published:
+            return
+        info = self._published[evt.room_id]
+        if info["mode"] != "journal":
+            return
+        if not self.config["journal_emoji_publish"]:
+            return
+
+        relates = evt.content.relates_to
+        if not relates or str(getattr(relates, "rel_type", "")) != "m.annotation":
+            return
+        if getattr(relates, "key", "") != "📰":
+            return
+
+        author_pl = self.config["journal_author_pl"]
+        user_level = await self._get_effective_power_level(evt.room_id, str(evt.sender))
+        if user_level < author_pl:
+            return
+
+        target_id = str(relates.event_id)
+        post = await self._get_post_internal(target_id)
+        if not post or post["room_id"] != evt.room_id:
+            return
+        if post["thread_root"] is not None:
+            return
+        if post["published"]:
+            return
+
+        await self._publish_post(target_id)
+
+        encoded = quote(info["alias"], safe="")
+        comment_count = await self.database.fetchval(
+            "SELECT COUNT(*) FROM messages WHERE thread_root=$1 AND redacted=FALSE",
+            target_id,
+        ) or 0
+        html = render_post_preview_html(post, encoded, comment_count)
+        self._notify_sse(evt.room_id, "new_message", {
+            "html": html, "is_thread": False,
+            "event_id": target_id,
         })
 
     # ------------------------------------------------------------------

@@ -44,3 +44,10 @@ async def upgrade_v2(conn: Connection) -> None:
 @upgrade_table.register(description="Add geo_uri for location messages")
 async def upgrade_v3(conn: Connection) -> None:
     await conn.execute("ALTER TABLE messages ADD COLUMN geo_uri TEXT")
+
+
+@upgrade_table.register(description="Add published flag for emoji-gated journal posts")
+async def upgrade_v4(conn: Connection) -> None:
+    await conn.execute(
+        "ALTER TABLE messages ADD COLUMN published BOOLEAN NOT NULL DEFAULT TRUE"
+    )

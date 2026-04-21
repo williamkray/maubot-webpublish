@@ -399,9 +399,18 @@ a:hover { text-decoration: underline; }
 .webpublish-header {
   position: sticky; top: 0; z-index: 100;
   padding: 24px 32px; border-bottom: 1px solid var(--border); background: var(--bg-secondary);
+  transition: padding 0.25s ease;
 }
 .webpublish-header h1 { font-size: 1.5rem; font-weight: 600; }
-.webpublish-header p  { color: var(--text-muted); margin-top: 4px; }
+.webpublish-header p  {
+  color: var(--text-muted); margin-top: 4px;
+  max-height: 6rem; overflow: hidden;
+  transition: max-height 0.25s ease, opacity 0.25s ease, margin-top 0.25s ease;
+}
+@media (max-width: 600px) {
+  .webpublish-header.scrolled { padding: 10px 32px; cursor: pointer; }
+  .webpublish-header.scrolled p { max-height: 0; opacity: 0; margin-top: 0; }
+}
 
 /* ---- chat mode ---- */
 .webpublish-chat { display: flex; flex-direction: column; height: calc(100vh - 85px); }
@@ -678,6 +687,36 @@ def _sse_post_detail_script(post_event_id: str) -> str:
     )
 
 
+def _scroll_header_script() -> str:
+    return (
+        '<script>\n'
+        '(function() {\n'
+        '  var header = document.querySelector(".webpublish-header");\n'
+        '  if (!header) return;\n'
+        '  var mq = window.matchMedia("(max-width: 600px)");\n'
+        '  var scroller = document.getElementById("messages") || window;\n'
+        '  function getScrollY() {\n'
+        '    return scroller === window ? window.scrollY : scroller.scrollTop;\n'
+        '  }\n'
+        '  function update() {\n'
+        '    if (mq.matches && getScrollY() > 10) {\n'
+        '      header.classList.add("scrolled");\n'
+        '    } else {\n'
+        '      header.classList.remove("scrolled");\n'
+        '    }\n'
+        '  }\n'
+        '  scroller.addEventListener("scroll", update, {passive: true});\n'
+        '  mq.addEventListener("change", update);\n'
+        '  header.addEventListener("click", function() {\n'
+        '    if (header.classList.contains("scrolled")) {\n'
+        '      scroller.scrollTo({top: 0, behavior: "smooth"});\n'
+        '    }\n'
+        '  });\n'
+        '})();\n'
+        '</script>'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Full page functions
 # ---------------------------------------------------------------------------
@@ -700,6 +739,7 @@ def render_chat_page(
     topic_p = f"  <p>{escape(room_topic)}</p>" if room_topic else ""
     sse = _sse_chat_script(encoded_alias)
     leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
+    scroll_script = _scroll_header_script()
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
@@ -707,7 +747,7 @@ def render_chat_page(
         f'</header>\n'
         f'<main class="webpublish-chat">\n'
         f'  <div class="webpublish-messages" id="messages">\n{msgs_html}\n  </div>\n'
-        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n</body>\n</html>'
+        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n{scroll_script}\n</body>\n</html>'
     )
 
 
@@ -743,6 +783,7 @@ def render_journal_landing(
     )
 
     sse = _sse_journal_landing_script(encoded_alias)
+    scroll_script = _scroll_header_script()
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
@@ -751,7 +792,7 @@ def render_journal_landing(
         f'<main class="webpublish-journal">\n'
         f'  <div class="webpublish-posts">\n{posts_html}\n  </div>\n'
         f'  {pag_html}\n'
-        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{sse}\n</body>\n</html>'
+        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{sse}\n{scroll_script}\n</body>\n</html>'
     )
 
 
@@ -785,6 +826,7 @@ def render_journal_post(
 
     sse = _sse_post_detail_script(post["event_id"])
     leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
+    scroll_script = _scroll_header_script()
     back_href = "../" if not encoded_alias else f"../../{encoded_alias}"
     return (
         f'{head}\n<body>\n'
@@ -804,5 +846,5 @@ def render_journal_post(
         f'    <h2>{label}</h2>\n'
         f'    <div id="comments">\n{comments_html}\n    </div>\n'
         f'  </section>\n'
-        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n</body>\n</html>'
+        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n{scroll_script}\n</body>\n</html>'
     )

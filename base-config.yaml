@@ -15,6 +15,12 @@ max_backfill: 1000
 min_power_level: 100
 # Minimum power level required to post top-level entries in journal rooms (ignored for chat rooms)
 journal_author_pl: 50
+# When true, hold new top-level journal posts as drafts until an author (meeting journal_author_pl)
+# reacts to the post with the 📰 (newspaper) emoji. Enables draft/review workflows.
+journal_emoji_publish: false
+# When false, the bot will not warn or redact messages from non-authors in journal rooms.
+# Authors still control publication via emoji reactions (if journal_emoji_publish is enabled).
+journal_enforce_messages: true
 # Base URL for the web interface (leave empty to auto-detect from maubot)
 # Example: https://your.maubot.host/_matrix/maubot/plugin/your-instance-id
 base_url: ""
