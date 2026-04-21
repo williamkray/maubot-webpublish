@@ -54,6 +54,7 @@ class WebPublishBot(Plugin):
         self._alias_to_room: dict[str, str] = {}    # alias (no #) -> room_id
         self._sse_queues: dict[str, set[asyncio.Queue]] = {}
         self._display_names: dict[str, str] = {}
+        self._avatar_urls: dict[str, str] = {}
         self._backfilling: set[str] = set()
         self._media_cache: OrderedDict[str, tuple[str, bytes]] = OrderedDict()
         self._media_cache_max: int = 100
@@ -109,18 +110,18 @@ class WebPublishBot(Plugin):
         body: str, formatted_body: str | None, msgtype: str,
         media_url: str | None, timestamp: int, thread_root: str | None,
         reply_to: str | None = None, geo_uri: str | None = None,
-        published: bool = True,
+        published: bool = True, avatar_url: str | None = None,
     ) -> None:
         await self.database.execute(
             "INSERT INTO messages "
             "(event_id, room_id, sender, sender_name, body, formatted_body, "
             "msgtype, media_url, timestamp, thread_root, reply_to, geo_uri, "
-            "edited, redacted, published) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,FALSE,FALSE,$13) "
+            "edited, redacted, published, avatar_url) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,FALSE,FALSE,$13,$14) "
             "ON CONFLICT (event_id) DO NOTHING",
             event_id, room_id, sender, sender_name, body, formatted_body,
             msgtype, media_url, timestamp, thread_root, reply_to, geo_uri,
-            published,
+            published, avatar_url or None,
         )
 
     async def _update_message_edit(
@@ -231,9 +232,12 @@ class WebPublishBot(Plugin):
                 room_id, EventType.ROOM_MEMBER, sender
             )
             name = member.displayname or sender
+            avatar = str(member.avatar_url) if getattr(member, "avatar_url", None) else ""
         except Exception:
             name = sender
+            avatar = ""
         self._display_names[sender] = name
+        self._avatar_urls[sender] = avatar
         return name
 
     async def _get_room_name(self, room_id: str) -> str:
@@ -503,6 +507,12 @@ class WebPublishBot(Plugin):
         max_msgs = self.config["max_backfill"]
         total = 0
         end_token: str | None = None
+        info = self._published.get(room_id, {})
+        is_journal_emoji = (
+            info.get("mode") == "journal"
+            and self.config["journal_emoji_publish"]
+        )
+        pending_reactions: list[tuple[str, str]] = []  # (sender, target_event_id)
 
         try:
             while total < max_msgs:
@@ -526,6 +536,12 @@ class WebPublishBot(Plugin):
                     break
 
                 for raw in chunk:
+                    if raw.get("type") == "m.reaction" and is_journal_emoji:
+                        rc = (raw.get("content") or {}).get("m.relates_to") or {}
+                        if rc.get("rel_type") == "m.annotation" and rc.get("key") == "📰":
+                            pending_reactions.append((raw.get("sender", ""), rc.get("event_id", "")))
+                        continue
+
                     if raw.get("type") != "m.room.message":
                         continue
                     if raw.get("unsigned", {}).get("redacted_because"):
@@ -555,6 +571,7 @@ class WebPublishBot(Plugin):
                         in_reply_to = (relates.get("m.in_reply_to") or {}).get("event_id")
 
                     sender_name = await self._get_sender_name(room_id, sender)
+                    sender_avatar = self._avatar_urls.get(sender, "") or None
                     backfill_msgtype = c.get("msgtype", "m.text")
                     backfill_geo_uri = None
                     if backfill_msgtype == "m.location":
@@ -562,6 +579,7 @@ class WebPublishBot(Plugin):
                             (c.get("org.matrix.msc3488.location") or {}).get("uri")
                             or c.get("geo_uri")
                         )
+                    backfill_published = not (is_journal_emoji and thread_root is None)
                     await self._store_message(
                         room_id=room_id,
                         event_id=raw["event_id"],
@@ -575,12 +593,28 @@ class WebPublishBot(Plugin):
                         thread_root=thread_root,
                         reply_to=in_reply_to,
                         geo_uri=backfill_geo_uri,
+                        avatar_url=sender_avatar,
+                        published=backfill_published,
                     )
                     total += 1
 
                 end_token = content.get("end")
                 if not end_token:
                     break
+
+            # Apply 📰 reactions collected during backfill
+            if pending_reactions:
+                author_pl = self.config["journal_author_pl"]
+                for reaction_sender, target_id in pending_reactions:
+                    if not target_id or not reaction_sender:
+                        continue
+                    user_level = await self._get_effective_power_level(room_id, reaction_sender)
+                    if user_level < author_pl:
+                        continue
+                    post = await self._get_post_internal(target_id)
+                    if not post or post["room_id"] != room_id or post["thread_root"] is not None:
+                        continue
+                    await self._publish_post(target_id)
 
             self.log.info(f"Backfill complete for {room_id}: {total} messages stored")
         except Exception as e:
@@ -666,6 +700,7 @@ class WebPublishBot(Plugin):
                     return
 
         sender_name = await self._get_sender_name(evt.room_id, str(evt.sender))
+        sender_avatar = self._avatar_urls.get(str(evt.sender), "") or None
         msgtype = str(content.msgtype) if content.msgtype else "m.text"
         media_url = str(content.url) if getattr(content, "url", None) else None
         formatted_body = (
@@ -702,6 +737,7 @@ class WebPublishBot(Plugin):
             reply_to=reply_to,
             geo_uri=geo_uri,
             published=published,
+            avatar_url=sender_avatar,
         )
 
         # SSE notification

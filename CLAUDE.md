@@ -54,6 +54,7 @@ Set per-room via `!webpublish chat|journal`:
 | `_published` | `room_id → {mode, alias}` — avoids DB lookup on every request |
 | `_alias_to_room` | `alias → room_id` — used by all web handlers |
 | `_display_names` | `sender_mxid → display_name` — avoids repeated API calls |
+| `_avatar_urls` | `sender_mxid → avatar mxc:// URL` — avoids repeated API calls |
 | `_sse_queues` | `room_id → set[Queue]` — live browser connections |
 | `_media_cache` | `"server/id" → (content_type, bytes)` — LRU media cache |
 
@@ -68,7 +69,7 @@ Set per-room via `!webpublish chat|journal`:
 
 ### Config keys (`base-config.yaml`)
 
-`css`, `pagination` (int), `max_backfill` (int), `min_power_level` (int), `base_url` (str, empty = auto-detect).
+`css`, `pagination` (int), `max_backfill` (int), `min_power_level` (int), `base_url` (str, empty = auto-detect), `journal_author_pl` (int), `journal_emoji_publish` (bool), `journal_enforce_messages` (bool).
 
 ### Route registration order
 
@@ -82,6 +83,33 @@ Set per-room via `!webpublish chat|journal`:
 
 `_sse_*_script` functions in `templates.py` emit inline `<script>` blocks that run on page load and may modify DOM elements — including `href` attributes. When debugging link behavior, search `templates.py` for `querySelector` and `href =` before assuming the HTML source is what the browser uses.
 
+### Live/backfill parity — critical invariant
+
+Any logic applied in `handle_message()` (the live event handler) **must be mirrored in `_backfill_room()`**. These two paths are the only ways messages enter the DB; divergence causes re-published rooms to behave differently from live rooms. Before finishing any change to message storage or published-state logic, explicitly check both call sites.
+
+Known parity points to keep in sync:
+- `published` flag: computed from `mode`, `thread_root`, and `journal_emoji_publish` config
+- `avatar_url`: fetched from `_avatar_urls` cache (populated by `_get_sender_name()`)
+- Reaction handling: `handle_reaction()` (live) vs. `pending_reactions` post-loop pass (backfill)
+
+### Adding a message field — checklist
+
+When adding a column to the `messages` table:
+
+1. `db.py` — new `upgrade_vN` migration
+2. `bot.py` `_store_message()` — add param, column, and `$N` placeholder
+3. `bot.py` live handler (`handle_message`) — fetch/compute value, pass to `_store_message()`
+4. `bot.py` backfill (`_backfill_room`) — same fetch/compute, same pass to `_store_message()`
+5. `templates.py` `render_message_html()` — read from `msg` dict if rendering it
+6. If the field affects the SSE live-update payload, update the `msg_dict` built after `_store_message()` in `handle_message()`
+
 ### Feature request files
 
 `fr-*.md` files in the repo root describe planned features. Reference these when implementing new functionality.
+
+### Clarify before implementing rendering or storage features
+
+When a feature affects how messages are displayed or stored, ask before coding if the intention is unclear:
+- Does it apply to historical messages (backfill) or only new ones?
+- Does it need to appear in SSE live-update payloads?
+- Are there mode-specific rules (chat vs. journal, top-level vs. thread)?

@@ -51,3 +51,8 @@ async def upgrade_v4(conn: Connection) -> None:
     await conn.execute(
         "ALTER TABLE messages ADD COLUMN published BOOLEAN NOT NULL DEFAULT TRUE"
     )
+
+
+@upgrade_table.register(description="Add avatar_url for sender profile pictures")
+async def upgrade_v5(conn: Connection) -> None:
+    await conn.execute("ALTER TABLE messages ADD COLUMN avatar_url TEXT")

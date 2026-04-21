@@ -243,10 +243,16 @@ def render_message_html(msg: dict, homeserver_url: str, proxy_base_url: str = ""
     edited = ' <span class="webpublish-edited">(edited)</span>' if msg.get("edited") else ""
     notice_cls = " webpublish-notice" if msg.get("msgtype") == "m.notice" else ""
     reply_html = _render_reply_header(msg) if show_reply_header else ""
+    raw_avatar = msg.get("avatar_url") or ""
+    if raw_avatar:
+        avatar_http = escape(mxc_to_http(raw_avatar, homeserver_url, proxy_base_url))
+        avatar_img = f'<img class="webpublish-avatar-img" src="{avatar_http}" alt="" onerror="this.style.display=\'none\'">'
+    else:
+        avatar_img = ""
 
     return (
         f'<div class="webpublish-message{notice_cls}" id="{eid}">\n'
-        f'  <div class="webpublish-avatar" style="background-color:{color}">{initials}</div>\n'
+        f'  <div class="webpublish-avatar" style="background-color:{color}">{initials}{avatar_img}</div>\n'
         f'  <div class="webpublish-message-content">\n'
         f'    {reply_html}'
         f'    <div class="webpublish-message-header">\n'
@@ -421,6 +427,11 @@ a:hover { text-decoration: underline; }
   width: 36px; height: 36px; border-radius: 50%;
   display: flex; align-items: center; justify-content: center;
   font-size: 0.75rem; font-weight: 600; color: #fff; flex-shrink: 0;
+  position: relative; overflow: hidden;
+}
+.webpublish-avatar-img {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: cover; border-radius: 50%;
 }
 .webpublish-message-content { min-width: 0; flex: 1; }
 .webpublish-message-header  { display: flex; align-items: baseline; gap: 8px; }
