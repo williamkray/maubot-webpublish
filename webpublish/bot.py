@@ -54,6 +54,8 @@ class WebPublishBot(Plugin):
         self._backfilling: set[str] = set()
         self._media_cache: OrderedDict[str, tuple[str, bytes]] = OrderedDict()
         self._media_cache_max: int = 100
+        self._tile_cache: OrderedDict[str, bytes] = OrderedDict()
+        self._tile_cache_max: int = 256
         self._room_create_cache: dict[str, tuple[int, set[str]]] = {}
         await self._load_published_rooms()
 
@@ -100,16 +102,16 @@ class WebPublishBot(Plugin):
         self, room_id: str, event_id: str, sender: str, sender_name: str,
         body: str, formatted_body: str | None, msgtype: str,
         media_url: str | None, timestamp: int, thread_root: str | None,
-        reply_to: str | None = None,
+        reply_to: str | None = None, geo_uri: str | None = None,
     ) -> None:
         await self.database.execute(
             "INSERT INTO messages "
             "(event_id, room_id, sender, sender_name, body, formatted_body, "
-            "msgtype, media_url, timestamp, thread_root, reply_to, edited, redacted) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE,FALSE) "
+            "msgtype, media_url, timestamp, thread_root, reply_to, geo_uri, edited, redacted) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,FALSE,FALSE) "
             "ON CONFLICT (event_id) DO NOTHING",
             event_id, room_id, sender, sender_name, body, formatted_body,
-            msgtype, media_url, timestamp, thread_root, reply_to,
+            msgtype, media_url, timestamp, thread_root, reply_to, geo_uri,
         )
 
     async def _update_message_edit(
@@ -504,6 +506,13 @@ class WebPublishBot(Plugin):
                         in_reply_to = (relates.get("m.in_reply_to") or {}).get("event_id")
 
                     sender_name = await self._get_sender_name(room_id, sender)
+                    backfill_msgtype = c.get("msgtype", "m.text")
+                    backfill_geo_uri = None
+                    if backfill_msgtype == "m.location":
+                        backfill_geo_uri = (
+                            (c.get("org.matrix.msc3488.location") or {}).get("uri")
+                            or c.get("geo_uri")
+                        )
                     await self._store_message(
                         room_id=room_id,
                         event_id=raw["event_id"],
@@ -511,11 +520,12 @@ class WebPublishBot(Plugin):
                         sender_name=sender_name,
                         body=body,
                         formatted_body=c.get("formatted_body"),
-                        msgtype=c.get("msgtype", "m.text"),
+                        msgtype=backfill_msgtype,
                         media_url=c.get("url"),
                         timestamp=raw.get("origin_server_ts", 0),
                         thread_root=thread_root,
                         reply_to=in_reply_to,
+                        geo_uri=backfill_geo_uri,
                     )
                     total += 1
 
@@ -613,6 +623,14 @@ class WebPublishBot(Plugin):
             if getattr(content, "formatted_body", None)
             else None
         )
+        geo_uri = None
+        if msgtype == "m.location":
+            geo_uri = (
+                (content.get("org.matrix.msc3488.location") or {}).get("uri")
+                or content.get("geo_uri")
+            )
+            if geo_uri:
+                geo_uri = str(geo_uri)
 
         await self._store_message(
             room_id=evt.room_id,
@@ -626,6 +644,7 @@ class WebPublishBot(Plugin):
             timestamp=evt.timestamp,
             thread_root=thread_root,
             reply_to=reply_to,
+            geo_uri=geo_uri,
         )
 
         # SSE notification
@@ -642,6 +661,7 @@ class WebPublishBot(Plugin):
             "timestamp": evt.timestamp,
             "thread_root": thread_root,
             "reply_to": reply_to,
+            "geo_uri": geo_uri,
             "edited": False,
             "redacted": False,
         }
@@ -715,6 +735,46 @@ class WebPublishBot(Plugin):
             self._media_cache.popitem(last=False)
         self._media_cache[cache_key] = (content_type, body)
         return self._media_cache[cache_key]
+
+    async def _fetch_tile(self, z: int, x: int, y: int) -> bytes | None:
+        cache_key = f"{z}/{x}/{y}"
+        if cache_key in self._tile_cache:
+            self._tile_cache.move_to_end(cache_key)
+            return self._tile_cache[cache_key]
+        url = f"https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+        try:
+            async with self.client.api.session.get(
+                url, headers={"User-Agent": "maubot-webpublish/1.0 (matrix bot tile proxy)"}
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                body = await resp.read()
+        except Exception as e:
+            self.log.warning(f"Tile proxy fetch failed for {cache_key}: {e}")
+            return None
+        if len(self._tile_cache) >= self._tile_cache_max:
+            self._tile_cache.popitem(last=False)
+        self._tile_cache[cache_key] = body
+        return body
+
+    @web.get("/tiles/{z}/{x}/{y}.png")
+    async def web_tile_proxy(self, req: Request) -> Response:
+        try:
+            z = int(req.match_info["z"])
+            x = int(req.match_info["x"])
+            y = int(req.match_info["y"])
+        except (ValueError, KeyError):
+            return Response(status=400, text="Invalid tile coordinates")
+        if not (0 <= z <= 19 and 0 <= x < 2**z and 0 <= y < 2**z):
+            return Response(status=400, text="Tile coordinates out of range")
+        body = await self._fetch_tile(z, x, y)
+        if body is None:
+            return Response(status=502, text="Upstream tile unavailable")
+        return Response(
+            body=body,
+            content_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     @web.get("/media/{server_name}/{media_id}")
     async def web_media_proxy(self, req: Request) -> Response:

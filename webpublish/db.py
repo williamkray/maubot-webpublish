@@ -39,3 +39,8 @@ async def upgrade_v1(conn: Connection) -> None:
 @upgrade_table.register(description="Add reply_to column for reply back-links")
 async def upgrade_v2(conn: Connection) -> None:
     await conn.execute("ALTER TABLE messages ADD COLUMN reply_to TEXT")
+
+
+@upgrade_table.register(description="Add geo_uri for location messages")
+async def upgrade_v3(conn: Connection) -> None:
+    await conn.execute("ALTER TABLE messages ADD COLUMN geo_uri TEXT")

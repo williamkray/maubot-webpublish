@@ -179,6 +179,30 @@ def render_body(msg: dict, homeserver_url: str, proxy_base_url: str = "") -> str
             return f'<a class="webpublish-file" href="{escape(url)}" download>{name}</a>'
         return f"[file: {name}]"
 
+    if msgtype == "m.location":
+        geo_uri = msg.get("geo_uri") or ""
+        osm_url = "https://www.openstreetmap.org"
+        try:
+            coords = geo_uri.removeprefix("geo:").split(";")[0].split(",")
+            lat, lon = float(coords[0]), float(coords[1])
+            osm_url = f"https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=14/{lat}/{lon}"
+            tile_url = f"{proxy_base_url.rstrip('/')}/tiles/{{z}}/{{x}}/{{y}}.png"
+            map_id = f"map-{abs(hash(geo_uri)) % 1_000_000}"
+            return (
+                f'<div class="webpublish-map" id="{map_id}"'
+                f' data-lat="{lat}" data-lon="{lon}"'
+                f' data-tile-url="{escape(tile_url)}"'
+                f' style="width:100%;height:300px;">'
+                f'<noscript><a href="{escape(osm_url)}" target="_blank" rel="noopener">'
+                f'View location ({lat}, {lon}) on OpenStreetMap</a></noscript>'
+                f'</div>'
+            )
+        except (IndexError, ValueError):
+            return (
+                f'<a href="{escape(osm_url)}" target="_blank" rel="noopener">'
+                f'[location: {escape(geo_uri or "unknown")}]</a>'
+            )
+
     if msgtype == "m.emote":
         name = escape(msg.get("sender_name") or msg.get("sender", ""))
         body = escape(msg.get("body", ""))
@@ -475,6 +499,7 @@ a:hover { text-decoration: underline; }
   background: var(--accent); color: #fff; border-color: var(--accent);
 }
 .webpublish-back-link { display: inline-block; margin-bottom: 16px; }
+.webpublish-map { position: relative; border-radius: 8px; overflow: hidden; }
 """
 
 
@@ -482,7 +507,34 @@ a:hover { text-decoration: underline; }
 # Page rendering
 # ---------------------------------------------------------------------------
 
-def _page_head(title: str, custom_css: str) -> str:
+_LEAFLET_HEAD_ASSETS = (
+    '<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">\n'
+    '<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>'
+)
+
+_LEAFLET_INIT_SCRIPT = (
+    '<script>\n'
+    '(function() {\n'
+    '  function initMaps(root) {\n'
+    '    (root || document).querySelectorAll(".webpublish-map:not([data-map-init])").forEach(function(el) {\n'
+    '      el.setAttribute("data-map-init", "1");\n'
+    '      var lat = parseFloat(el.getAttribute("data-lat"));\n'
+    '      var lon = parseFloat(el.getAttribute("data-lon"));\n'
+    '      var tileUrl = el.getAttribute("data-tile-url");\n'
+    '      if (isNaN(lat) || isNaN(lon)) return;\n'
+    '      var map = L.map(el, {zoomControl:true, scrollWheelZoom:false}).setView([lat,lon], 14);\n'
+    '      L.tileLayer(tileUrl, {maxZoom:19, attribution:\'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors\'}).addTo(map);\n'
+    '      L.marker([lat,lon]).addTo(map);\n'
+    '    });\n'
+    '  }\n'
+    '  initMaps();\n'
+    '  window._wpInitMaps = initMaps;\n'
+    '})();\n'
+    '</script>'
+)
+
+
+def _page_head(title: str, custom_css: str, extra_head: str = "") -> str:
     # User CSS goes in a second <style> block that follows BASE_CSS. This ensures
     # @import-ed themes and :root variable overrides win via cascade order
     # (later blocks beat earlier blocks at the same specificity). Within the user
@@ -494,6 +546,7 @@ def _page_head(title: str, custom_css: str) -> str:
     css_overrides = "\n".join(override_lines)
     user_css = f"{css_imports}\n{css_overrides}".strip()
     user_style = f"<style>\n{user_css}\n</style>\n" if user_css else ""
+    leaflet = f"{extra_head}\n" if extra_head else ""
     return (
         f'<!DOCTYPE html>\n<html lang="en">\n<head>\n'
         f'<meta charset="utf-8">\n'
@@ -501,6 +554,7 @@ def _page_head(title: str, custom_css: str) -> str:
         f'<title>{escape(title)}</title>\n'
         f'<style>\n{BASE_CSS}\n</style>\n'
         f'{user_style}'
+        f'{leaflet}'
         f'</head>'
     )
 
@@ -544,6 +598,7 @@ def _sse_chat_script(encoded_alias: str) -> str:
         '    var near = isNearBottom();\n'
         '    msgs.insertAdjacentHTML("beforeend", d.html);\n'
         '    if (window._wpLocalizeTimestamps) window._wpLocalizeTimestamps(msgs.lastElementChild);\n'
+        '    if (window._wpInitMaps) window._wpInitMaps(msgs.lastElementChild);\n'
         '    if (near) scrollBottom();\n'
         '  });\n'
         '  src.addEventListener("edit_message", function(e) {\n'
@@ -603,6 +658,7 @@ def _sse_post_detail_script(post_event_id: str) -> str:
         '    if (el) {\n'
         '      el.insertAdjacentHTML("beforeend", d.html);\n'
         '      if (window._wpLocalizeTimestamps) window._wpLocalizeTimestamps(el.lastElementChild);\n'
+        '      if (window._wpInitMaps) window._wpInitMaps(el.lastElementChild);\n'
         '    }\n'
         '  });\n'
         '  src.addEventListener("edit_message", function(e) {\n'
@@ -628,6 +684,9 @@ def _sse_post_detail_script(post_event_id: str) -> str:
 # Full page functions
 # ---------------------------------------------------------------------------
 
+def _needs_leaflet(messages: list[dict]) -> bool:
+    return any(m.get("msgtype") == "m.location" and m.get("geo_uri") for m in messages)
+
 def render_chat_page(
     room_name: str,
     room_topic: str,
@@ -637,10 +696,12 @@ def render_chat_page(
     homeserver_url: str,
     proxy_base_url: str = "",
 ) -> str:
-    head = _page_head(room_name, custom_css)
+    has_maps = _needs_leaflet(messages)
+    head = _page_head(room_name, custom_css, extra_head=_LEAFLET_HEAD_ASSETS if has_maps else "")
     msgs_html = "\n".join(render_message_html(m, homeserver_url, proxy_base_url) for m in messages)
     topic_p = f"  <p>{escape(room_topic)}</p>" if room_topic else ""
     sse = _sse_chat_script(encoded_alias)
+    leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
@@ -648,7 +709,7 @@ def render_chat_page(
         f'</header>\n'
         f'<main class="webpublish-chat">\n'
         f'  <div class="webpublish-messages" id="messages">\n{msgs_html}\n  </div>\n'
-        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{sse}\n</body>\n</html>'
+        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n</body>\n</html>'
     )
 
 
@@ -706,7 +767,8 @@ def render_journal_post(
     proxy_base_url: str = "",
 ) -> str:
     title = (post.get("body") or "").split("\n", 1)[0][:80]
-    head = _page_head(f"{title} - {room_name}", custom_css)
+    has_maps = _needs_leaflet([post] + comments)
+    head = _page_head(f"{title} - {room_name}", custom_css, extra_head=_LEAFLET_HEAD_ASSETS if has_maps else "")
     body_html = render_body(post, homeserver_url, proxy_base_url)
     author = escape(post.get("sender_name") or post["sender"])
     date = format_date(post["timestamp"])
@@ -724,6 +786,7 @@ def render_journal_post(
     label = f"{count} comment{'s' if count != 1 else ''}" if count else "No comments yet"
 
     sse = _sse_post_detail_script(post["event_id"])
+    leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
@@ -742,5 +805,5 @@ def render_journal_post(
         f'    <h2>{label}</h2>\n'
         f'    <div id="comments">\n{comments_html}\n    </div>\n'
         f'  </section>\n'
-        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{sse}\n</body>\n</html>'
+        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n</body>\n</html>'
     )
