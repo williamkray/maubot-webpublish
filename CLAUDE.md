@@ -70,6 +70,18 @@ Set per-room via `!webpublish chat|journal`:
 
 `css`, `pagination` (int), `max_backfill` (int), `min_power_level` (int), `base_url` (str, empty = auto-detect).
 
+### Route registration order
+
+`@web.*` decorated methods are registered via `dir()` (alphabetical by method name). Dynamic routes like `/{alias}` shadow literal routes registered later alphabetically — put specific routes on methods that sort *before* the catch-all, or use a regex pattern like `/{alias:[^/]+}` to prevent empty-alias matches.
+
+### Maubot trailing-slash invariant
+
+`handle_plugin_path` in maubot's server checks `request.path.startswith(plugin_prefix + "/")` — the plugin prefix always ends with `/`. A request to `/_matrix/maubot/plugin/bloggo` (no trailing slash) returns 404 at the maubot level, never reaching the plugin. Root alias pages must use trailing-slash URLs (`bloggo/`) to route correctly.
+
+### JS modifying HTML link attributes
+
+`_sse_*_script` functions in `templates.py` emit inline `<script>` blocks that run on page load and may modify DOM elements — including `href` attributes. When debugging link behavior, search `templates.py` for `querySelector` and `href =` before assuming the HTML source is what the browser uses.
+
 ### Feature request files
 
 `fr-*.md` files in the repo root describe planned features. Reference these when implementing new functionality.
