@@ -63,6 +63,16 @@ plugin_config:
     # Minimum power level to post top-level entries in journal rooms (ignored for chat rooms)
     journal_author_pl: 50
 
+    # When enabled, new top-level journal posts are held as drafts until an author
+    # (meeting journal_author_pl) reacts to the post with the 📰 (newspaper) emoji.
+    # Useful for multi-author rooms where posts need approval before going live.
+    journal_emoji_publish: false
+
+    # When true, the bot redacts top-level messages from users below journal_author_pl
+    # and notifies them (requires the bot to have redact permission in the room).
+    # Set to false to allow anyone to post but still gate publication via emoji reactions.
+    journal_enforce_messages: true
+
     # Override the public base URL used for web links posted into rooms.
     # Leave empty to auto-detect from the server.public_url above.
     base_url: ""

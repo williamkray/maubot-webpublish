@@ -164,5 +164,20 @@ css custom properties (variables) that control the color scheme:
 `max_backfill`: when publishing is enabled, how many messages should the bot retrieve from room history? defaults to
 1000.
 
+`min_power_level`: minimum Matrix power level required to run `!webpublish` commands. defaults to 100 (room admin).
+
+`journal_author_pl`: minimum power level to post top-level entries in journal rooms. users below this level are subject
+to the `journal_enforce_messages` and `journal_emoji_publish` rules. ignored in chat rooms. defaults to 50.
+
+`journal_emoji_publish`: when `true`, new top-level journal posts are held as unpublished drafts until an author
+(meeting `journal_author_pl`) reacts to the post with the 📰 (newspaper) emoji. the post then appears on the site.
+useful for multi-author rooms where posts should go through a lightweight approval step before going live.
+defaults to `false` (all posts publish immediately).
+
+`journal_enforce_messages`: when `true`, the bot redacts top-level messages from users below `journal_author_pl` and
+sends them a notice explaining why. requires the bot to have redact permission in the room. when `false`, non-author
+messages are silently ignored and never appear on the site — useful if you want to allow readers to post in the room
+without having the bot redact their messages. defaults to `true`.
+
 `base_url`: the full base url of this plugin's web endpoint. leave empty to auto-detect from maubot. only needed if
 your maubot instance is behind a reverse proxy with a different public url.
