@@ -249,7 +249,13 @@ def _render_reply_header(msg: dict) -> str:
     )
 
 
-def render_message_html(msg: dict, homeserver_url: str, proxy_base_url: str = "", show_reply_header: bool = True) -> str:
+def render_message_html(
+    msg: dict,
+    homeserver_url: str,
+    proxy_base_url: str = "",
+    show_reply_header: bool = True,
+    thread_indicator_html: str = "",
+) -> str:
     eid = safe_element_id(msg["event_id"])
     color = sender_color(msg["sender"])
     initials = sender_initials(msg.get("sender_name") or msg["sender"])
@@ -266,6 +272,7 @@ def render_message_html(msg: dict, homeserver_url: str, proxy_base_url: str = ""
         avatar_img = f'<img class="webpublish-avatar-img" src="{avatar_http}" alt="" onerror="this.style.display=\'none\'">'
     else:
         avatar_img = ""
+    indicator = f'    {thread_indicator_html}\n' if thread_indicator_html else ""
 
     return (
         f'<div class="webpublish-message{notice_cls}" id="{eid}">\n'
@@ -277,8 +284,58 @@ def render_message_html(msg: dict, homeserver_url: str, proxy_base_url: str = ""
         f'      <time class="webpublish-timestamp" datetime="{iso}">{time_str}</time>{edited}\n'
         f'    </div>\n'
         f'    <div class="webpublish-body">{body_html}</div>\n'
+        f'{indicator}'
         f'  </div>\n'
         f'</div>'
+    )
+
+
+def _render_mini_avatar(participant: dict, homeserver_url: str, proxy_base_url: str) -> str:
+    sender = participant.get("sender", "")
+    name = participant.get("sender_name") or sender
+    color = sender_color(sender)
+    initials = sender_initials(name)
+    raw_avatar = participant.get("avatar_url") or ""
+    if raw_avatar:
+        http = escape(mxc_to_http(raw_avatar, homeserver_url, proxy_base_url))
+        img = (
+            f'<img class="webpublish-avatar-img" src="{http}" alt=""'
+            f' onerror="this.style.display=\'none\'">'
+        )
+    else:
+        img = ""
+    title = escape(name)
+    return (
+        f'<span class="webpublish-thread-avatar" style="background-color:{color}"'
+        f' title="{title}">{initials}{img}</span>'
+    )
+
+
+def render_thread_indicator_html(
+    root_event_id: str,
+    count: int,
+    participants: list[dict],
+    homeserver_url: str,
+    proxy_base_url: str = "",
+) -> str:
+    if count <= 0:
+        return ""
+    avatars = "".join(
+        _render_mini_avatar(p, homeserver_url, proxy_base_url)
+        for p in participants[:5]
+    )
+    more = (
+        '<span class="webpublish-thread-more" aria-hidden="true">+</span>'
+        if len(participants) > 5 else ""
+    )
+    label = f"{count} repl{'y' if count == 1 else 'ies'}"
+    return (
+        f'<button type="button" class="webpublish-thread-indicator"'
+        f' data-root="{escape(root_event_id)}"'
+        f' aria-label="Open thread with {label}">'
+        f'<span class="webpublish-thread-avatars">{avatars}{more}</span>'
+        f'<span class="webpublish-thread-count">{label}</span>'
+        f'</button>'
     )
 
 
@@ -595,6 +652,65 @@ a:hover { text-decoration: underline; }
 .webpublish-feed-footer a { color: var(--text-muted); }
 .webpublish-feed-footer a:hover { color: var(--accent); }
 .webpublish-map { position: relative; border-radius: 8px; overflow: hidden; }
+
+/* ---- thread indicator & side panel (chat mode) ---- */
+.webpublish-thread-indicator {
+  display: inline-flex; align-items: center; gap: 8px;
+  margin-top: 6px; padding: 4px 10px 4px 4px;
+  background: var(--bg-secondary); border: 1px solid var(--border);
+  border-radius: 16px; cursor: pointer; font: inherit; color: var(--accent);
+}
+.webpublish-thread-indicator:hover { border-color: var(--accent); }
+.webpublish-thread-avatars { display: inline-flex; align-items: center; }
+.webpublish-thread-avatar {
+  width: 22px; height: 22px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 0.65rem; font-weight: 600; color: #fff;
+  position: relative; overflow: hidden;
+  border: 2px solid var(--bg-secondary); box-sizing: content-box;
+}
+.webpublish-thread-avatar + .webpublish-thread-avatar { margin-left: -8px; }
+.webpublish-thread-more {
+  margin-left: -4px; padding: 0 6px; font-size: 0.75rem;
+  color: var(--text-muted); align-self: center;
+}
+.webpublish-thread-count { font-size: 0.8rem; font-weight: 500; }
+
+.webpublish-thread-panel {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: min(420px, 40vw);
+  background: var(--bg); border-left: 1px solid var(--border);
+  box-shadow: -4px 0 16px rgba(0,0,0,0.18);
+  transform: translateX(100%); transition: transform 0.2s ease;
+  z-index: 200; display: flex; flex-direction: column;
+}
+.webpublish-thread-panel[hidden] { display: none; }
+.webpublish-thread-panel.open { transform: none; }
+.webpublish-thread-panel-inner { display: flex; flex-direction: column; height: 100%; }
+.webpublish-thread-panel-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+  background: var(--bg-secondary); flex-shrink: 0;
+}
+.webpublish-thread-panel-title { font-weight: 600; font-size: 0.95rem; }
+.webpublish-thread-panel-close {
+  background: none; border: 0; color: var(--text); cursor: pointer;
+  font-size: 1.4rem; line-height: 1; padding: 0 4px;
+}
+.webpublish-thread-panel-close:hover { color: var(--accent); }
+.webpublish-thread-panel-body {
+  flex: 1; overflow-y: auto; padding: 12px 16px;
+}
+.webpublish-thread-panel-body .webpublish-message { padding: 8px 0; }
+body.has-thread-panel .webpublish-chat .webpublish-messages {
+  padding-right: calc(min(420px, 40vw) + 32px);
+}
+@media (max-width: 600px) {
+  .webpublish-thread-panel { width: 100%; left: 0; }
+  body.has-thread-panel .webpublish-chat .webpublish-messages {
+    padding-right: 32px;
+  }
+}
 """
 
 
@@ -726,10 +842,31 @@ def _sse_chat_script(encoded_alias: str) -> str:
         '<script>\n'
         '(function() {\n'
         '  var msgs = document.getElementById("messages");\n'
+        '  var panel = document.getElementById("thread-panel");\n'
         '  function isNearBottom() {\n'
         '    return msgs.scrollHeight - msgs.clientHeight <= msgs.scrollTop + 80;\n'
         '  }\n'
         '  function scrollBottom() { msgs.scrollTop = msgs.scrollHeight; }\n'
+        '  function panelInnerRoot() {\n'
+        '    if (!panel || panel.hidden) return null;\n'
+        '    var inner = panel.querySelector(".webpublish-thread-panel-inner");\n'
+        '    return inner && inner.dataset.root ? inner : null;\n'
+        '  }\n'
+        '  function findInPanel(elementId) {\n'
+        '    var inner = panelInnerRoot();\n'
+        '    if (!inner) return null;\n'
+        '    var body = inner.querySelector(".webpublish-thread-panel-body");\n'
+        '    return body ? body.querySelector("#" + CSS.escape(elementId)) : null;\n'
+        '  }\n'
+        '  function applyEdit(el, d) {\n'
+        '    var body = el.querySelector(".webpublish-body");\n'
+        '    if (body) body.innerHTML = d.body_html;\n'
+        '    var hdr = el.querySelector(".webpublish-message-header");\n'
+        '    if (hdr && !hdr.querySelector(".webpublish-edited")) {\n'
+        '      hdr.insertAdjacentHTML("beforeend",\n'
+        '        \' <span class="webpublish-edited">(edited)</span>\');\n'
+        '    }\n'
+        '  }\n'
         '  scrollBottom();\n'
         f'  var src = new EventSource("{sse_url}");\n'
         '  src.addEventListener("new_message", function(e) {\n'
@@ -740,23 +877,147 @@ def _sse_chat_script(encoded_alias: str) -> str:
         '    if (window._wpInitMaps) window._wpInitMaps(msgs.lastElementChild);\n'
         '    if (near) scrollBottom();\n'
         '  });\n'
+        '  src.addEventListener("thread_reply", function(e) {\n'
+        '    var d = JSON.parse(e.data);\n'
+        '    var root = document.getElementById(d.root_element_id);\n'
+        '    if (root) {\n'
+        '      var content = root.querySelector(".webpublish-message-content");\n'
+        '      if (content) {\n'
+        '        var existing = content.querySelector(".webpublish-thread-indicator");\n'
+        '        if (existing) existing.outerHTML = d.indicator_html;\n'
+        '        else content.insertAdjacentHTML("beforeend", d.indicator_html);\n'
+        '      }\n'
+        '    }\n'
+        '    var inner = panelInnerRoot();\n'
+        '    if (inner && inner.dataset.root === d.thread_root) {\n'
+        '      var body = inner.querySelector(".webpublish-thread-panel-body");\n'
+        '      if (body && !body.querySelector("#" + CSS.escape(d.reply_element_id))) {\n'
+        '        var near = body.scrollHeight - body.clientHeight <= body.scrollTop + 80;\n'
+        '        body.insertAdjacentHTML("beforeend", d.reply_html);\n'
+        '        if (window._wpLocalizeTimestamps) window._wpLocalizeTimestamps(body.lastElementChild);\n'
+        '        if (window._wpInitMaps) window._wpInitMaps(body.lastElementChild);\n'
+        '        if (near) body.scrollTop = body.scrollHeight;\n'
+        '      }\n'
+        '    }\n'
+        '  });\n'
+        '  src.addEventListener("thread_reply_removed", function(e) {\n'
+        '    var d = JSON.parse(e.data);\n'
+        '    var root = document.getElementById(d.root_element_id);\n'
+        '    if (root) {\n'
+        '      var content = root.querySelector(".webpublish-message-content");\n'
+        '      if (content) {\n'
+        '        var existing = content.querySelector(".webpublish-thread-indicator");\n'
+        '        if (d.indicator_html) {\n'
+        '          if (existing) existing.outerHTML = d.indicator_html;\n'
+        '          else content.insertAdjacentHTML("beforeend", d.indicator_html);\n'
+        '        } else if (existing) {\n'
+        '          existing.remove();\n'
+        '        }\n'
+        '      }\n'
+        '    }\n'
+        '    var inPanel = findInPanel(d.removed_element_id);\n'
+        '    if (inPanel) inPanel.remove();\n'
+        '  });\n'
         '  src.addEventListener("edit_message", function(e) {\n'
         '    var d = JSON.parse(e.data);\n'
-        '    var el = document.getElementById(d.element_id);\n'
-        '    if (!el) return;\n'
-        '    var body = el.querySelector(".webpublish-body");\n'
-        '    if (body) body.innerHTML = d.body_html;\n'
-        '    var hdr = el.querySelector(".webpublish-message-header");\n'
-        '    if (hdr && !hdr.querySelector(".webpublish-edited")) {\n'
-        '      hdr.insertAdjacentHTML("beforeend",\n'
-        '        \' <span class="webpublish-edited">(edited)</span>\');\n'
-        '    }\n'
+        '    var el = document.getElementById(d.element_id) || findInPanel(d.element_id);\n'
+        '    if (el) applyEdit(el, d);\n'
         '  });\n'
         '  src.addEventListener("redact_message", function(e) {\n'
         '    var d = JSON.parse(e.data);\n'
         '    var el = document.getElementById(d.element_id);\n'
         '    if (el) el.remove();\n'
+        '    var p = findInPanel(d.element_id);\n'
+        '    if (p) p.remove();\n'
         '  });\n'
+        '})();\n'
+        '</script>'
+    )
+
+
+def _thread_panel_script(encoded_alias: str) -> str:
+    # Base URL for thread fragment fetches is computed client-side to keep the
+    # script alias-agnostic; the server registers both /{alias}/thread/{id}
+    # and /thread/{id}.
+    return (
+        '<script>\n'
+        '(function() {\n'
+        '  var panel = document.getElementById("thread-panel");\n'
+        '  if (!panel) return;\n'
+        '  var currentRoot = null;\n'
+        '  function buildUrl(rootEid) {\n'
+        '    var path = window.location.pathname.replace(/\\/$/, "");\n'
+        '    return path + "/thread/" + encodeURIComponent(rootEid);\n'
+        '  }\n'
+        '  function stripThreadQuery() {\n'
+        '    var sp = new URLSearchParams(window.location.search);\n'
+        '    sp.delete("thread");\n'
+        '    var qs = sp.toString();\n'
+        '    return window.location.pathname + (qs ? "?" + qs : "") + window.location.hash;\n'
+        '  }\n'
+        '  function setThreadQuery(rootEid) {\n'
+        '    var sp = new URLSearchParams(window.location.search);\n'
+        '    sp.set("thread", rootEid);\n'
+        '    return window.location.pathname + "?" + sp.toString() + window.location.hash;\n'
+        '  }\n'
+        '  function wireClose() {\n'
+        '    var btn = panel.querySelector(".webpublish-thread-panel-close");\n'
+        '    if (btn) btn.addEventListener("click", function() {\n'
+        '      closePanel(true);\n'
+        '    });\n'
+        '  }\n'
+        '  function openPanel(rootEid, pushHistory) {\n'
+        '    if (currentRoot === rootEid && !panel.hidden) return;\n'
+        '    fetch(buildUrl(rootEid), {credentials: "same-origin"}).then(function(resp) {\n'
+        '      if (!resp.ok) throw new Error("fetch failed: " + resp.status);\n'
+        '      return resp.text();\n'
+        '    }).then(function(html) {\n'
+        '      panel.innerHTML = html;\n'
+        '      panel.hidden = false;\n'
+        '      requestAnimationFrame(function() { panel.classList.add("open"); });\n'
+        '      document.body.classList.add("has-thread-panel");\n'
+        '      currentRoot = rootEid;\n'
+        '      wireClose();\n'
+        '      if (window._wpLocalizeTimestamps) window._wpLocalizeTimestamps(panel);\n'
+        '      if (window._wpInitMaps) window._wpInitMaps(panel);\n'
+        '      if (pushHistory) {\n'
+        '        history.pushState({thread: rootEid}, "", setThreadQuery(rootEid));\n'
+        '      }\n'
+        '    }).catch(function(err) {\n'
+        '      console.error("thread panel fetch failed", err);\n'
+        '    });\n'
+        '  }\n'
+        '  function closePanel(pushHistory) {\n'
+        '    panel.classList.remove("open");\n'
+        '    document.body.classList.remove("has-thread-panel");\n'
+        '    currentRoot = null;\n'
+        '    setTimeout(function() {\n'
+        '      if (!panel.classList.contains("open")) {\n'
+        '        panel.hidden = true;\n'
+        '        panel.innerHTML = "";\n'
+        '      }\n'
+        '    }, 220);\n'
+        '    if (pushHistory) {\n'
+        '      history.pushState({}, "", stripThreadQuery());\n'
+        '    }\n'
+        '  }\n'
+        '  document.addEventListener("click", function(e) {\n'
+        '    var btn = e.target.closest(".webpublish-thread-indicator");\n'
+        '    if (!btn) return;\n'
+        '    e.preventDefault();\n'
+        '    var root = btn.getAttribute("data-root");\n'
+        '    if (!root) return;\n'
+        '    if (currentRoot === root && !panel.hidden) closePanel(true);\n'
+        '    else openPanel(root, true);\n'
+        '  });\n'
+        '  window.addEventListener("popstate", function(e) {\n'
+        '    var sp = new URLSearchParams(window.location.search);\n'
+        '    var t = sp.get("thread");\n'
+        '    if (t) openPanel(t, false);\n'
+        '    else closePanel(false);\n'
+        '  });\n'
+        '  var initial = new URLSearchParams(window.location.search).get("thread");\n'
+        '  if (initial) openPanel(initial, false);\n'
         '})();\n'
         '</script>'
     )
@@ -901,15 +1162,31 @@ def render_chat_page(
     homeserver_url: str,
     proxy_base_url: str = "",
     room_avatar_url: str = "",
+    comment_counts: dict[str, int] | None = None,
+    thread_participants: dict[str, list[dict]] | None = None,
 ) -> str:
+    counts = comment_counts or {}
+    parts = thread_participants or {}
     has_maps = _needs_leaflet(messages)
     head = _page_head(room_name, custom_css, extra_head=_LEAFLET_HEAD_ASSETS if has_maps else "")
-    msgs_html = "\n".join(render_message_html(m, homeserver_url, proxy_base_url) for m in messages)
+    msg_chunks: list[str] = []
+    for m in messages:
+        eid = m["event_id"]
+        count = counts.get(eid, 0)
+        indicator = render_thread_indicator_html(
+            eid, count, parts.get(eid, []), homeserver_url, proxy_base_url,
+        ) if count else ""
+        msg_chunks.append(render_message_html(
+            m, homeserver_url, proxy_base_url,
+            thread_indicator_html=indicator,
+        ))
+    msgs_html = "\n".join(msg_chunks)
     topic_p = (
         f"  <p>{escape(room_topic)}</p>\n"
         f'  <button class="webpublish-topic-toggle" type="button" aria-expanded="false" hidden>Show more</button>'
     ) if room_topic else ""
     sse = _sse_chat_script(encoded_alias)
+    panel_script = _thread_panel_script(encoded_alias)
     leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
     scroll_script = _scroll_header_script()
     avatar_img = _render_room_avatar_img(room_avatar_url, proxy_base_url)
@@ -920,7 +1197,42 @@ def render_chat_page(
         f'</header>\n'
         f'<main class="webpublish-chat">\n'
         f'  <div class="webpublish-messages" id="messages">\n{msgs_html}\n  </div>\n'
-        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n{scroll_script}\n</body>\n</html>'
+        f'</main>\n'
+        f'<aside class="webpublish-thread-panel" id="thread-panel" hidden></aside>\n'
+        f'{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n{panel_script}\n{scroll_script}\n'
+        f'</body>\n</html>'
+    )
+
+
+def render_thread_panel_fragment(
+    root_msg: dict,
+    comments: list[dict],
+    homeserver_url: str,
+    proxy_base_url: str = "",
+) -> str:
+    root_html = render_message_html(
+        root_msg, homeserver_url, proxy_base_url, show_reply_header=False,
+    )
+    comments_html = "\n".join(
+        render_message_html(
+            c, homeserver_url, proxy_base_url,
+            show_reply_header=bool(c.get("reply_to")),
+        )
+        for c in comments
+    )
+    count = len(comments)
+    label = f"{count} repl{'y' if count == 1 else 'ies'}" if count else "No replies yet"
+    return (
+        f'<div class="webpublish-thread-panel-inner" data-root="{escape(root_msg["event_id"])}">\n'
+        f'  <div class="webpublish-thread-panel-header">\n'
+        f'    <span class="webpublish-thread-panel-title">Thread · {escape(label)}</span>\n'
+        f'    <button type="button" class="webpublish-thread-panel-close" aria-label="Close">&times;</button>\n'
+        f'  </div>\n'
+        f'  <div class="webpublish-thread-panel-body">\n'
+        f'    {root_html}\n'
+        f'    {comments_html}\n'
+        f'  </div>\n'
+        f'</div>'
     )
 
 

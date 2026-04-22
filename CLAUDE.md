@@ -34,12 +34,19 @@ Messages arrive via `@event.on(EventType.ROOM_MESSAGE)` in `handle_message()`, g
 
 Set per-room via `!webpublish chat|journal`:
 
-- **chat** — All messages rendered as a scrollable chat log.
+- **chat** — Top-level messages render as a scrollable chat log. Threaded replies are hidden from the main list; each root message that has replies shows a `.webpublish-thread-indicator` (count + up to 5 participant avatars) which opens a right-side `<aside id="thread-panel">` panel. The panel is lazy-loaded from `/{alias}/thread/{event_id}`, deep-linkable via `?thread=<event_id>`, and covers the full viewport on screens <600px.
 - **journal** — Top-level messages are blog posts; threaded replies are comments on a post. The `thread_root` column in `messages` links comments to their post.
 
 ### Live updates (SSE)
 
 `/{alias}/sse` keeps a long-lived HTTP connection open per browser tab. Each room has a `set[asyncio.Queue]` in `self._sse_queues`. When a new message arrives, `_notify_sse()` puts an item in every queue for that room. The SSE handler streams it to the browser as a JSON payload containing pre-rendered HTML.
+
+**Event types emitted:**
+- `new_message` — top-level messages in both modes; journal thread replies (old behavior — client filters by `d.thread_root`).
+- `edit_message` — body edits; payload has `element_id` and `body_html`.
+- `redact_message` — message deleted; payload has `element_id`.
+- `thread_reply` *(chat mode only)* — new threaded reply. Payload: `thread_root`, `root_element_id`, `count`, `indicator_html`, `reply_html`, `reply_element_id`. Client replaces the indicator DOM on the root and, if the thread panel is open for that root, appends the reply.
+- `thread_reply_removed` *(chat mode only)* — a threaded reply was redacted. Same payload shape as `thread_reply` but with `removed_element_id` instead of `reply_*`; `indicator_html` is empty when `count == 0`.
 
 ### Media proxy
 
@@ -90,11 +97,15 @@ Always add `self.log.debug(f"...: {e}")` in the except clause so failures are vi
 
 ### Config keys (`base-config.yaml`)
 
-`css`, `pagination` (int), `max_backfill` (int), `min_power_level` (int), `base_url` (str, empty = auto-detect), `journal_author_pl` (int), `journal_emoji_publish` (bool), `journal_enforce_messages` (bool).
+`css`, `pagination` (int), `max_backfill` (int), `min_power_level` (int), `base_url` (str, empty = auto-detect), `journal_author_pl` (int), `journal_emoji_publish` (bool), `journal_enforce_messages` (bool), `chat_author_pl` (int), `chat_enforce_messages` (bool).
+
+`chat_enforce_messages` mirrors `journal_enforce_messages`: when true, top-level chat messages from users below `chat_author_pl` are redacted (threaded replies bypass). Enforcement is live-only — backfill does not retroactively redact, matching the journal precedent.
 
 ### Route registration order
 
 `@web.*` decorated methods are registered via `dir()` (alphabetical by method name). Dynamic routes like `/{alias}` shadow literal routes registered later alphabetically — put specific routes on methods that sort *before* the catch-all, or use a regex pattern like `/{alias:[^/]+}` to prevent empty-alias matches.
+
+Reserved alias names (checked in `seturi`, set as `RESERVED_ALIASES` in `bot.py`): `media`, `tiles`, `theme`, `tag`, `tags`, `post`, `sse`, `feed.xml`, `thread`. Any URI that would collide with a literal route segment belongs here.
 
 ### Maubot trailing-slash invariant
 

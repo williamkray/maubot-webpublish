@@ -21,6 +21,13 @@ journal_emoji_publish: false
 # When false, the bot will not warn or redact messages from non-authors in journal rooms.
 # Authors still control publication via emoji reactions (if journal_emoji_publish is enabled).
 journal_enforce_messages: true
+# Minimum power level required to post top-level messages in chat rooms when
+# chat_enforce_messages is enabled (threaded replies are always permitted).
+chat_author_pl: 50
+# When true, the bot redacts top-level chat messages from users below chat_author_pl
+# (requires the bot to have redact permission in the room). Threaded replies bypass
+# this check, letting lower-privileged users participate via threads. Default false.
+chat_enforce_messages: false
 # Base URL for the web interface (leave empty to auto-detect from maubot)
 # Example: https://your.maubot.host/_matrix/maubot/plugin/your-instance-id
 base_url: ""

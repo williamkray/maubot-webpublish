@@ -26,6 +26,8 @@ from .templates import (
     render_post_preview_html,
     render_tag_filter_page,
     render_tag_index_page,
+    render_thread_indicator_html,
+    render_thread_panel_fragment,
     safe_element_id,
 )
 
@@ -42,6 +44,11 @@ _MEDIA_CACHE_CONTROL = "public, max-age=86400"
 
 # Matrix state event type used to store per-room config overrides.
 CONFIG_STATE_TYPE = "org.jobmachine.webpublish.config"
+
+# Aliases that would collide with web routes if allowed as a room URI.
+RESERVED_ALIASES: frozenset[str] = frozenset({
+    "media", "tiles", "theme", "tag", "tags", "post", "sse", "feed.xml", "thread",
+})
 
 
 def _parse_bool(s: str) -> bool:
@@ -63,6 +70,8 @@ OVERRIDABLE_CONFIG: dict[str, Callable[[str], Any]] = {
     "journal_author_pl": int,
     "journal_emoji_publish": _parse_bool,
     "journal_enforce_messages": _parse_bool,
+    "chat_author_pl": int,
+    "chat_enforce_messages": _parse_bool,
 }
 
 
@@ -76,6 +85,8 @@ class Config(BaseProxyConfig):
         helper.copy("journal_author_pl")
         helper.copy("journal_emoji_publish")
         helper.copy("journal_enforce_messages")
+        helper.copy("chat_author_pl")
+        helper.copy("chat_enforce_messages")
 
 
 class WebPublishBot(Plugin):
@@ -200,13 +211,20 @@ class WebPublishBot(Plugin):
         )
 
     async def _get_messages(
-        self, room_id: str, limit: int = 500
+        self, room_id: str, limit: int = 500, top_level_only: bool = False,
     ) -> list[dict]:
-        rows = await self.database.fetch(
-            "SELECT * FROM messages WHERE room_id=$1 AND redacted=FALSE "
-            "ORDER BY timestamp DESC LIMIT $2",
-            room_id, limit,
-        )
+        if top_level_only:
+            rows = await self.database.fetch(
+                "SELECT * FROM messages WHERE room_id=$1 AND redacted=FALSE "
+                "AND thread_root IS NULL ORDER BY timestamp DESC LIMIT $2",
+                room_id, limit,
+            )
+        else:
+            rows = await self.database.fetch(
+                "SELECT * FROM messages WHERE room_id=$1 AND redacted=FALSE "
+                "ORDER BY timestamp DESC LIMIT $2",
+                room_id, limit,
+            )
         return [dict(r) for r in reversed(rows)]
 
     async def _get_posts(
@@ -241,6 +259,40 @@ class WebPublishBot(Plugin):
         for row in rows:
             counts[row["thread_root"]] = row["n"]
         return counts
+
+    async def _get_thread_participants(
+        self, root_event_ids: list[str], per_root_limit: int = 6,
+    ) -> dict[str, list[dict]]:
+        """Return up to `per_root_limit` distinct participants per thread root,
+        ordered by earliest reply timestamp. Each entry is a dict with sender,
+        sender_name, avatar_url."""
+        result: dict[str, list[dict]] = {eid: [] for eid in root_event_ids}
+        if not root_event_ids:
+            return result
+        placeholders = ",".join(f"${i + 1}" for i in range(len(root_event_ids)))
+        rows = await self.database.fetch(
+            f"SELECT thread_root, sender, sender_name, avatar_url FROM ("
+            f"  SELECT thread_root, sender,"
+            f"         MIN(sender_name) AS sender_name,"
+            f"         MIN(avatar_url) AS avatar_url,"
+            f"         MIN(timestamp) AS first_ts,"
+            f"         ROW_NUMBER() OVER ("
+            f"           PARTITION BY thread_root ORDER BY MIN(timestamp) ASC"
+            f"         ) AS rn"
+            f"  FROM messages"
+            f"  WHERE thread_root IN ({placeholders}) AND redacted=FALSE"
+            f"  GROUP BY thread_root, sender"
+            f") s WHERE rn <= ${len(root_event_ids) + 1} "
+            f"ORDER BY thread_root, first_ts ASC",
+            *root_event_ids, per_root_limit,
+        )
+        for row in rows:
+            result[row["thread_root"]].append({
+                "sender": row["sender"],
+                "sender_name": row["sender_name"] or row["sender"],
+                "avatar_url": row["avatar_url"] or "",
+            })
+        return result
 
     async def _get_post(self, event_id: str) -> dict | None:
         row = await self.database.fetchrow(
@@ -627,6 +679,11 @@ class WebPublishBot(Plugin):
             if not re.match(r'^[a-zA-Z0-9_\-]+$', alias):
                 await evt.reply("Invalid URI. Use only letters, numbers, hyphens, and underscores.")
                 return
+            if alias in RESERVED_ALIASES:
+                await evt.reply(
+                    f"`{alias}` is reserved for internal routes. Choose a different URI."
+                )
+                return
         existing_owner = self._alias_to_room.get(alias)
         if existing_owner and existing_owner != evt.room_id:
             await evt.reply("That URI is already in use by another room.")
@@ -985,6 +1042,29 @@ class WebPublishBot(Plugin):
                         )
                     return
 
+        # --- chat enforcement (parallels journal rule; live-only, like journal) ---
+        if info["mode"] == "chat" and thread_root is None:
+            if self._get_room_config(evt.room_id, "chat_enforce_messages"):
+                author_pl = self._get_room_config(evt.room_id, "chat_author_pl")
+                user_level = await self._get_effective_power_level(
+                    evt.room_id, str(evt.sender)
+                )
+                if user_level < author_pl:
+                    try:
+                        await self.client.redact(
+                            evt.room_id, evt.event_id,
+                            reason="Top-level chat message below chat_author_pl",
+                        )
+                    except Exception:
+                        await evt.reply(
+                            "Top-level messages in this room require power level "
+                            f"{author_pl}. Reply in a thread to participate, or ask "
+                            "an admin to raise your level. This message should be "
+                            "redacted but the bot lacks permission — please redact "
+                            "it manually."
+                        )
+                    return
+
         sender_name = await self._get_sender_name(evt.room_id, str(evt.sender))
         sender_avatar = self._avatar_urls.get(str(evt.sender), "") or None
         msgtype = str(content.msgtype) if content.msgtype else "m.text"
@@ -1050,10 +1130,30 @@ class WebPublishBot(Plugin):
 
         base = self._base_url
         if info["mode"] == "chat":
-            html = render_message_html(msg_dict, hs, base)
-            self._notify_sse(evt.room_id, "new_message", {
-                "html": html, "event_id": str(evt.event_id),
-            })
+            if thread_root:
+                count_map = await self._get_comment_counts([thread_root])
+                count = count_map.get(thread_root, 0)
+                parts_map = await self._get_thread_participants([thread_root], 6)
+                indicator_html = render_thread_indicator_html(
+                    thread_root, count, parts_map.get(thread_root, []), hs, base,
+                )
+                reply_html = render_message_html(
+                    msg_dict, hs, base, show_reply_header=bool(reply_to),
+                )
+                self._notify_sse(evt.room_id, "thread_reply", {
+                    "thread_root": thread_root,
+                    "root_element_id": safe_element_id(thread_root),
+                    "count": count,
+                    "indicator_html": indicator_html,
+                    "reply_html": reply_html,
+                    "reply_element_id": safe_element_id(str(evt.event_id)),
+                    "event_id": str(evt.event_id),
+                })
+            else:
+                html = render_message_html(msg_dict, hs, base)
+                self._notify_sse(evt.room_id, "new_message", {
+                    "html": html, "event_id": str(evt.event_id),
+                })
         else:  # journal
             if thread_root:
                 html = render_message_html(msg_dict, hs, base, show_reply_header=bool(reply_to))
@@ -1082,10 +1182,35 @@ class WebPublishBot(Plugin):
             return
 
         redacted_id = str(redacted_id)
+        # Capture thread_root before the row is deleted so we can update the
+        # indicator on the root message if a threaded reply was redacted.
+        row = await self.database.fetchrow(
+            "SELECT thread_root FROM messages WHERE event_id=$1", redacted_id,
+        )
+        thread_root = row["thread_root"] if row else None
+
         await self._mark_redacted(redacted_id)
         self._notify_sse(evt.room_id, "redact_message", {
             "element_id": safe_element_id(redacted_id),
         })
+
+        info = self._published.get(evt.room_id)
+        if info and info["mode"] == "chat" and thread_root:
+            count_map = await self._get_comment_counts([thread_root])
+            count = count_map.get(thread_root, 0)
+            parts_map = await self._get_thread_participants([thread_root], 6)
+            hs = self._homeserver_url()
+            indicator_html = render_thread_indicator_html(
+                thread_root, count, parts_map.get(thread_root, []),
+                hs, self._base_url,
+            )
+            self._notify_sse(evt.room_id, "thread_reply_removed", {
+                "thread_root": thread_root,
+                "root_element_id": safe_element_id(thread_root),
+                "count": count,
+                "indicator_html": indicator_html,
+                "removed_element_id": safe_element_id(redacted_id),
+            })
 
     @event.on(EventType.REACTION)
     async def handle_reaction(self, evt: MessageEvent) -> None:
@@ -1364,11 +1489,18 @@ class WebPublishBot(Plugin):
         encoded = "" if alias == "/" else alias
 
         if info["mode"] == "chat":
-            messages = await self._get_messages(room_id, limit=200)
+            messages = await self._get_messages(
+                room_id, limit=200, top_level_only=True,
+            )
             await self._enrich_reply_context(messages)
+            eids = [m["event_id"] for m in messages]
+            comment_counts = await self._get_comment_counts(eids)
+            thread_participants = await self._get_thread_participants(eids, 6)
             html = render_chat_page(
                 room_name, room_topic, messages, encoded, css, hs, self._base_url,
                 room_avatar_url=room_avatar_url,
+                comment_counts=comment_counts,
+                thread_participants=thread_participants,
             )
         else:
             page = int(req.query.get("page", "1"))
@@ -1432,6 +1564,50 @@ class WebPublishBot(Plugin):
         return Response(text=html, content_type="text/html",
                         headers={"Cache-Control": _HTML_CACHE_CONTROL})
 
+    @web.get("/{alias}/thread/{event_id}")
+    async def web_alias_thread(self, req: Request) -> Response:
+        return await self._handle_thread_fragment(
+            req, unquote(req.match_info["alias"]),
+            unquote(req.match_info["event_id"]),
+        )
+
+    @web.get("/thread/{event_id}")
+    async def web_alias_thread_root(self, req: Request) -> Response:
+        return await self._handle_thread_fragment(
+            req, "/", unquote(req.match_info["event_id"]),
+        )
+
+    async def _handle_thread_fragment(
+        self, req: Request, alias: str, event_id: str,
+    ) -> Response:
+        room_id = self._alias_to_room.get(alias)
+        if not room_id:
+            return Response(status=404, text="Room not found")
+        target_alias = self._redirect_aliases.get(alias)
+        if target_alias:
+            if target_alias == "/":
+                location = f"{self._base_url}/thread/{event_id}"
+            else:
+                location = f"{self._base_url}/{target_alias}/thread/{event_id}"
+            return Response(status=302, headers={"Location": location})
+
+        info = self._published[room_id]
+        if info["mode"] != "chat":
+            return Response(status=404, text="Thread panel only available in chat mode")
+
+        root = await self._get_post_internal(event_id)
+        if not root or root["room_id"] != room_id or root["thread_root"] is not None:
+            return Response(status=404, text="Thread root not found")
+
+        comments = await self._get_thread_comments(event_id)
+        await self._enrich_reply_context(comments)
+        hs = self._homeserver_url()
+        html = render_thread_panel_fragment(root, comments, hs, self._base_url)
+        return Response(
+            text=html, content_type="text/html",
+            headers={"Cache-Control": "no-store"},
+        )
+
     @web.get("/{alias}/sse")
     async def web_sse(self, req: Request) -> StreamResponse:
         return await self._handle_sse(req, unquote(req.match_info["alias"]))
@@ -1457,17 +1633,46 @@ class WebPublishBot(Plugin):
 
         # replay missed events on reconnect
         hs = self._homeserver_url()
+        info = self._published.get(room_id, {})
         last_id = req.headers.get("Last-Event-ID")
         if last_id:
             missed = await self._get_messages_after_event(room_id, last_id)
             for msg in missed:
-                html = render_message_html(msg, hs, self._base_url)
-                payload = json.dumps({"html": html, "event_id": msg["event_id"]})
-                await resp.write(
-                    f"id: {msg['event_id']}\n"
-                    f"event: new_message\n"
-                    f"data: {payload}\n\n".encode()
-                )
+                thread_root = msg.get("thread_root")
+                if info.get("mode") == "chat" and thread_root:
+                    count_map = await self._get_comment_counts([thread_root])
+                    count = count_map.get(thread_root, 0)
+                    parts_map = await self._get_thread_participants([thread_root], 6)
+                    indicator_html = render_thread_indicator_html(
+                        thread_root, count, parts_map.get(thread_root, []),
+                        hs, self._base_url,
+                    )
+                    reply_html = render_message_html(
+                        msg, hs, self._base_url,
+                        show_reply_header=bool(msg.get("reply_to")),
+                    )
+                    payload = json.dumps({
+                        "thread_root": thread_root,
+                        "root_element_id": safe_element_id(thread_root),
+                        "count": count,
+                        "indicator_html": indicator_html,
+                        "reply_html": reply_html,
+                        "reply_element_id": safe_element_id(msg["event_id"]),
+                        "event_id": msg["event_id"],
+                    })
+                    await resp.write(
+                        f"id: {msg['event_id']}\n"
+                        f"event: thread_reply\n"
+                        f"data: {payload}\n\n".encode()
+                    )
+                else:
+                    html = render_message_html(msg, hs, self._base_url)
+                    payload = json.dumps({"html": html, "event_id": msg["event_id"]})
+                    await resp.write(
+                        f"id: {msg['event_id']}\n"
+                        f"event: new_message\n"
+                        f"data: {payload}\n\n".encode()
+                    )
 
         queue: asyncio.Queue = asyncio.Queue(maxsize=256)
         self._sse_queues.setdefault(room_id, set()).add(queue)
