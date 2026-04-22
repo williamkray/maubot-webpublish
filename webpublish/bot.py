@@ -1275,6 +1275,7 @@ class WebPublishBot(Plugin):
         comments = await self._get_thread_comments(event_id)
         await self._enrich_reply_context(comments)
         room_name = await self._get_room_name(room_id) or (alias if alias != "/" else "")
+        room_topic = await self._get_room_topic(room_id)
         room_avatar_url = await self._get_room_avatar(room_id)
         hs = self._homeserver_url()
         css = self.config["css"]
@@ -1282,7 +1283,7 @@ class WebPublishBot(Plugin):
         post["tags"] = await self._get_tags_for_post(event_id)
 
         html = render_journal_post(
-            room_name, post, comments, encoded, css, hs, self._base_url,
+            room_name, room_topic, post, comments, encoded, css, hs, self._base_url,
             room_avatar_url=room_avatar_url,
         )
         return Response(text=html, content_type="text/html",

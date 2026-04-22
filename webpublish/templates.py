@@ -939,6 +939,7 @@ def render_journal_landing(
 
 def render_journal_post(
     room_name: str,
+    room_topic: str,
     post: dict,
     comments: list[dict],
     encoded_alias: str,
@@ -977,10 +978,11 @@ def render_journal_post(
     scroll_script = _scroll_header_script()
     back_href = "../" if not encoded_alias else f"../../{encoded_alias}"
     avatar_img = _render_room_avatar_img(room_avatar_url, proxy_base_url)
+    topic_p = f"  <p>{escape(room_topic)}</p>" if room_topic else ""
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
-        f'  <div class="webpublish-header-title">{avatar_img}<h1>{escape(room_name)}</h1></div>\n'
+        f'  <div class="webpublish-header-title">{avatar_img}<h1>{escape(room_name)}</h1></div>\n{topic_p}\n'
         f'</header>\n'
         f'<main class="webpublish-post-full">\n'
         f'  <a class="webpublish-back-link" href="{back_href}">&larr; back to posts</a>\n'
