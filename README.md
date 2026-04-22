@@ -181,3 +181,10 @@ without having the bot redact their messages. defaults to `true`.
 
 `base_url`: the full base url of this plugin's web endpoint. leave empty to auto-detect from maubot. only needed if
 your maubot instance is behind a reverse proxy with a different public url.
+
+# scaling
+
+for larger deployments (many rooms, many concurrent readers, high-traffic pages) see [SCALING.md](SCALING.md) —
+it documents the caching behaviour the plugin ships with, when to add a reverse-proxy cache or CDN in front of maubot,
+and the situations in which the more structural changes (pub/sub SSE fanout, retention policies, rendered-HTML caching)
+are worth the lift.

@@ -29,6 +29,17 @@ from .templates import (
     safe_element_id,
 )
 
+# Short freshness + generous stale-while-revalidate. SSE pushes updates live, so
+# cache refresh isn't the primary path to seeing new messages. This mostly
+# offloads repeat/refresh traffic to browser + reverse proxy + CDN.
+_HTML_CACHE_CONTROL = "public, max-age=60, stale-while-revalidate=600"
+
+# Media above this size streams through without occupying an LRU cache slot.
+# Keeps the 100-entry cache useful for avatars/small images and avoids a single
+# video eviction-thrashing everything else.
+_MEDIA_STREAM_THRESHOLD = 2 * 1024 * 1024
+_MEDIA_CACHE_CONTROL = "public, max-age=86400"
+
 
 class Config(BaseProxyConfig):
     def do_update(self, helper: ConfigUpdateHelper) -> None:
@@ -62,6 +73,9 @@ class WebPublishBot(Plugin):
         self._avatar_urls: dict[str, str] = {}
         self._room_avatars: dict[str, str] = {}
         self._backfilling: set[str] = set()
+        # Cap simultaneous room backfills so rebuilding several rooms at once
+        # doesn't saturate the homeserver pagination endpoint or the DB pool.
+        self._backfill_semaphore: asyncio.Semaphore = asyncio.Semaphore(2)
         self._media_cache: OrderedDict[str, tuple[str, bytes]] = OrderedDict()
         self._media_cache_max: int = 100
         self._tile_cache: OrderedDict[str, bytes] = OrderedDict()
@@ -187,14 +201,18 @@ class WebPublishBot(Plugin):
         return [dict(r) for r in rows], total_pages
 
     async def _get_comment_counts(self, event_ids: list[str]) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for eid in event_ids:
-            val = await self.database.fetchval(
-                "SELECT COUNT(*) FROM messages "
-                "WHERE thread_root=$1 AND redacted=FALSE",
-                eid,
-            )
-            counts[eid] = val or 0
+        counts: dict[str, int] = {eid: 0 for eid in event_ids}
+        if not event_ids:
+            return counts
+        placeholders = ",".join(f"${i + 1}" for i in range(len(event_ids)))
+        rows = await self.database.fetch(
+            f"SELECT thread_root, COUNT(*) AS n FROM messages "
+            f"WHERE thread_root IN ({placeholders}) AND redacted=FALSE "
+            f"GROUP BY thread_root",
+            *event_ids,
+        )
+        for row in rows:
+            counts[row["thread_root"]] = row["n"]
         return counts
 
     async def _get_post(self, event_id: str) -> dict | None:
@@ -611,6 +629,13 @@ class WebPublishBot(Plugin):
         if room_id in self._backfilling:
             return
         self._backfilling.add(room_id)
+        try:
+            async with self._backfill_semaphore:
+                await self._backfill_room_inner(room_id)
+        finally:
+            self._backfilling.discard(room_id)
+
+    async def _backfill_room_inner(self, room_id: str) -> None:
         max_msgs = self.config["max_backfill"]
         total = 0
         end_token: str | None = None
@@ -745,8 +770,6 @@ class WebPublishBot(Plugin):
             self.log.info(f"Backfill complete for {room_id}: {total} messages stored")
         except Exception as e:
             self.log.error(f"Backfill error for {room_id}: {e}")
-        finally:
-            self._backfilling.discard(room_id)
 
     # ------------------------------------------------------------------
     # Live event handlers
@@ -979,31 +1002,16 @@ class WebPublishBot(Plugin):
     # Web handlers
     # ------------------------------------------------------------------
 
-    async def _fetch_media(self, server_name: str, media_id: str) -> tuple[str, bytes] | None:
-        """Fetch media from the homeserver using bot credentials, with LRU caching."""
-        cache_key = f"{server_name}/{media_id}"
+    def _media_cache_get(self, cache_key: str) -> tuple[str, bytes] | None:
         if cache_key in self._media_cache:
             self._media_cache.move_to_end(cache_key)
             return self._media_cache[cache_key]
+        return None
 
-        hs = self._homeserver_url()
-        url = f"{hs}/_matrix/media/v3/download/{cache_key}"
-        try:
-            async with self.client.api.session.get(
-                url, headers={"Authorization": f"Bearer {self.client.api.token}"}
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                content_type = resp.content_type or "application/octet-stream"
-                body = await resp.read()
-        except Exception as e:
-            self.log.warning(f"Media proxy fetch failed for {cache_key}: {e}")
-            return None
-
+    def _media_cache_put(self, cache_key: str, value: tuple[str, bytes]) -> None:
         if len(self._media_cache) >= self._media_cache_max:
             self._media_cache.popitem(last=False)
-        self._media_cache[cache_key] = (content_type, body)
-        return self._media_cache[cache_key]
+        self._media_cache[cache_key] = value
 
     async def _fetch_tile(self, z: int, x: int, y: int) -> bytes | None:
         cache_key = f"{z}/{x}/{y}"
@@ -1046,18 +1054,54 @@ class WebPublishBot(Plugin):
         )
 
     @web.get("/media/{server_name}/{media_id}")
-    async def web_media_proxy(self, req: Request) -> Response:
+    async def web_media_proxy(self, req: Request) -> StreamResponse:
         server_name = req.match_info["server_name"]
         media_id = req.match_info["media_id"]
-        result = await self._fetch_media(server_name, media_id)
-        if result is None:
+        cache_key = f"{server_name}/{media_id}"
+
+        cached = self._media_cache_get(cache_key)
+        if cached is not None:
+            content_type, body = cached
+            return Response(body=body, content_type=content_type,
+                            headers={"Cache-Control": _MEDIA_CACHE_CONTROL})
+
+        hs = self._homeserver_url()
+        url = f"{hs}/_matrix/media/v3/download/{cache_key}"
+        try:
+            upstream_cm = self.client.api.session.get(
+                url, headers={"Authorization": f"Bearer {self.client.api.token}"}
+            )
+            async with upstream_cm as upstream:
+                if upstream.status != 200:
+                    return Response(status=404, text="Media not found")
+                content_type = upstream.content_type or "application/octet-stream"
+                clen = upstream.content_length
+
+                # Small/known-size: buffer + cache, as before.
+                if clen is not None and clen <= _MEDIA_STREAM_THRESHOLD:
+                    body = await upstream.read()
+                    self._media_cache_put(cache_key, (content_type, body))
+                    return Response(body=body, content_type=content_type,
+                                    headers={"Cache-Control": _MEDIA_CACHE_CONTROL})
+
+                # Large or unknown-size: stream chunk-by-chunk, skip the cache.
+                stream = StreamResponse(
+                    headers={"Cache-Control": _MEDIA_CACHE_CONTROL}
+                )
+                stream.content_type = content_type
+                if clen is not None:
+                    stream.content_length = clen
+                await stream.prepare(req)
+                try:
+                    async for chunk in upstream.content.iter_chunked(64 * 1024):
+                        await stream.write(chunk)
+                    await stream.write_eof()
+                except (ConnectionResetError, ConnectionError, asyncio.CancelledError):
+                    pass
+                return stream
+        except Exception as e:
+            self.log.warning(f"Media proxy fetch failed for {cache_key}: {e}")
             return Response(status=404, text="Media not found")
-        content_type, body = result
-        return Response(
-            body=body,
-            content_type=content_type,
-            headers={"Cache-Control": "public, max-age=86400"},
-        )
 
     @web.get("/theme/{name}.css")
     async def web_theme_css(self, req: Request) -> Response:
@@ -1112,7 +1156,8 @@ class WebPublishBot(Plugin):
         tags = await self._get_tag_counts(room_id)
         encoded = "" if alias == "/" else alias
         html = render_tag_index_page(room_name, tags, encoded, self.config["css"], self._base_url, room_avatar_url=room_avatar_url)
-        return Response(text=html, content_type="text/html")
+        return Response(text=html, content_type="text/html",
+                        headers={"Cache-Control": _HTML_CACHE_CONTROL})
 
     @web.get("/{alias}/tag/{name}")
     async def web_tag_filter(self, req: Request) -> Response:
@@ -1147,7 +1192,8 @@ class WebPublishBot(Plugin):
             self.config["css"], counts, self._base_url,
             room_avatar_url=room_avatar_url,
         )
-        return Response(text=html, content_type="text/html")
+        return Response(text=html, content_type="text/html",
+                        headers={"Cache-Control": _HTML_CACHE_CONTROL})
 
     @web.get("/{alias}")
     async def web_main(self, req: Request) -> Response:
@@ -1197,7 +1243,8 @@ class WebPublishBot(Plugin):
                 room_avatar_url=room_avatar_url,
             )
 
-        return Response(text=html, content_type="text/html")
+        return Response(text=html, content_type="text/html",
+                        headers={"Cache-Control": _HTML_CACHE_CONTROL})
 
     @web.get("/{alias}/post/{event_id}")
     async def web_post_detail(self, req: Request) -> Response:
@@ -1238,7 +1285,8 @@ class WebPublishBot(Plugin):
             room_name, post, comments, encoded, css, hs, self._base_url,
             room_avatar_url=room_avatar_url,
         )
-        return Response(text=html, content_type="text/html")
+        return Response(text=html, content_type="text/html",
+                        headers={"Cache-Control": _HTML_CACHE_CONTROL})
 
     @web.get("/{alias}/sse")
     async def web_sse(self, req: Request) -> StreamResponse:

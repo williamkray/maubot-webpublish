@@ -77,3 +77,14 @@ async def upgrade_v7(conn: Connection) -> None:
     await conn.execute(
         "CREATE INDEX idx_post_tags_room_tag ON post_tags (room_id, tag)"
     )
+
+
+@upgrade_table.register(description="Partial index to accelerate published journal post listings")
+async def upgrade_v8(conn: Connection) -> None:
+    # Matches the exact predicate of _get_posts(); turns the landing-page query
+    # into an index scan instead of a filtered scan of every row in the room.
+    await conn.execute(
+        "CREATE INDEX idx_messages_published_posts "
+        "ON messages (room_id, timestamp DESC) "
+        "WHERE thread_root IS NULL AND redacted = FALSE AND published = TRUE"
+    )
