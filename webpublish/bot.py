@@ -24,6 +24,7 @@ from .templates import (
     render_journal_post,
     render_message_html,
     render_post_preview_html,
+    render_reactions_html,
     render_tag_filter_page,
     render_tag_index_page,
     render_thread_indicator_html,
@@ -394,6 +395,99 @@ class WebPublishBot(Plugin):
             room_id, ref["timestamp"],
         )
         return [dict(r) for r in rows]
+
+    async def _store_reaction(
+        self, reaction_event_id: str, target_event_id: str, room_id: str,
+        sender: str, key: str, timestamp: int,
+    ) -> None:
+        await self.database.execute(
+            "INSERT INTO reactions "
+            "(reaction_event_id, target_event_id, room_id, sender, key, timestamp) "
+            "VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (reaction_event_id) DO NOTHING",
+            reaction_event_id, target_event_id, room_id, sender, key, timestamp,
+        )
+
+    async def _mark_reaction_redacted(self, reaction_event_id: str) -> tuple[str, str] | None:
+        row = await self.database.fetchrow(
+            "SELECT target_event_id, room_id FROM reactions "
+            "WHERE reaction_event_id=$1 AND redacted=FALSE",
+            reaction_event_id,
+        )
+        if not row:
+            return None
+        await self.database.execute(
+            "UPDATE reactions SET redacted=TRUE WHERE reaction_event_id=$1",
+            reaction_event_id,
+        )
+        return (row["target_event_id"], row["room_id"])
+
+    async def _get_reactions_for_events(
+        self, event_ids: list[str],
+    ) -> dict[str, list[dict]]:
+        result: dict[str, list[dict]] = {eid: [] for eid in event_ids}
+        if not event_ids:
+            return result
+        placeholders = ",".join(f"${i + 1}" for i in range(len(event_ids)))
+        rows = await self.database.fetch(
+            f"SELECT target_event_id, key, sender FROM reactions "
+            f"WHERE target_event_id IN ({placeholders}) AND redacted=FALSE "
+            f"ORDER BY timestamp",
+            *event_ids,
+        )
+        # Group in Python so the query works on both asyncpg and aiosqlite
+        # (ARRAY_AGG / ANY(...::text[]) are Postgres-only).
+        grouped: dict[str, dict[str, list[str]]] = {}
+        for row in rows:
+            by_key = grouped.setdefault(row["target_event_id"], {})
+            senders = by_key.setdefault(row["key"], [])
+            if row["sender"] not in senders:
+                senders.append(row["sender"])
+        for tid, by_key in grouped.items():
+            items = [
+                {"key": k, "count": len(senders), "senders": senders}
+                for k, senders in by_key.items()
+            ]
+            items.sort(key=lambda x: (-x["count"], x["key"]))
+            result[tid] = items
+        return result
+
+    def _should_hide_publish_emoji(self, room_id: str, msg: dict) -> bool:
+        """📰 on a top-level journal post is a control signal when
+        `journal_emoji_publish` is on — hide it from the reactions UI."""
+        info = self._published.get(room_id) or {}
+        if info.get("mode") != "journal":
+            return False
+        if not self._get_room_config(room_id, "journal_emoji_publish"):
+            return False
+        return msg.get("thread_root") is None
+
+    async def _apply_reactions_to_messages(
+        self, room_id: str, messages: list[dict],
+    ) -> None:
+        """Hydrate msg['reactions'] for each message. Strips 📰 on top-level
+        journal posts when `journal_emoji_publish` is enabled (control signal)."""
+        if not messages:
+            return
+        event_ids = [m["event_id"] for m in messages]
+        reactions = await self._get_reactions_for_events(event_ids)
+        for m in messages:
+            lst = reactions.get(m["event_id"], [])
+            if lst and self._should_hide_publish_emoji(room_id, m):
+                lst = [r for r in lst if r["key"] != "📰"]
+            m["reactions"] = lst
+
+    async def _reactions_html_for_event(
+        self, room_id: str, event_id: str,
+    ) -> str:
+        target = await self.database.fetchrow(
+            "SELECT event_id, thread_root FROM messages WHERE event_id=$1",
+            event_id,
+        )
+        target_dict = dict(target) if target else {"event_id": event_id, "thread_root": None}
+        reactions = (await self._get_reactions_for_events([event_id])).get(event_id, [])
+        if reactions and self._should_hide_publish_emoji(room_id, target_dict):
+            reactions = [r for r in reactions if r["key"] != "📰"]
+        return render_reactions_html(reactions)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -832,7 +926,8 @@ class WebPublishBot(Plugin):
             info.get("mode") == "journal"
             and self._get_room_config(room_id, "journal_emoji_publish")
         )
-        pending_reactions: list[tuple[str, str]] = []  # (sender, target_event_id)
+        # (reaction_event_id, target_id, sender, key, timestamp)
+        pending_reactions: list[tuple[str, str, str, str, int]] = []
         pending_edits: dict[str, tuple[str, str | None]] = {}  # target_event_id -> (body, formatted_body)
 
         try:
@@ -857,10 +952,21 @@ class WebPublishBot(Plugin):
                     break
 
                 for raw in chunk:
-                    if raw.get("type") == "m.reaction" and is_journal_emoji:
+                    if raw.get("type") == "m.reaction":
+                        if raw.get("unsigned", {}).get("redacted_because"):
+                            continue
                         rc = (raw.get("content") or {}).get("m.relates_to") or {}
-                        if rc.get("rel_type") == "m.annotation" and rc.get("key") == "📰":
-                            pending_reactions.append((raw.get("sender", ""), rc.get("event_id", "")))
+                        if rc.get("rel_type") != "m.annotation":
+                            continue
+                        rkey = rc.get("key", "") or ""
+                        rtarget = rc.get("event_id", "") or ""
+                        rsender = raw.get("sender", "") or ""
+                        reid = raw.get("event_id", "") or ""
+                        if rkey and rtarget and rsender and reid:
+                            pending_reactions.append((
+                                reid, rtarget, rsender, rkey,
+                                raw.get("origin_server_ts", 0),
+                            ))
                         continue
 
                     if raw.get("type") != "m.room.message":
@@ -931,13 +1037,31 @@ class WebPublishBot(Plugin):
                 if not end_token:
                     break
 
-            # Apply 📰 reactions collected during backfill
+            # Persist every collected reaction. Only rows whose target_event_id
+            # ultimately exists in `messages` will render — but we store all of
+            # them so if the target arrives later (partial backfill) they still
+            # surface on next aggregation.
             if pending_reactions:
+                for reid, target_id, rsender, rkey, rts in pending_reactions:
+                    await self._store_reaction(
+                        reaction_event_id=reid,
+                        target_event_id=target_id,
+                        room_id=room_id,
+                        sender=rsender,
+                        key=rkey,
+                        timestamp=rts,
+                    )
+
+            # Preserve the 📰 publish-gate pass: mark matching top-level journal
+            # posts as published if a privileged user reacted with 📰.
+            if pending_reactions and is_journal_emoji:
                 author_pl = self._get_room_config(room_id, "journal_author_pl")
-                for reaction_sender, target_id in pending_reactions:
-                    if not target_id or not reaction_sender:
+                for _reid, target_id, rsender, rkey, _rts in pending_reactions:
+                    if rkey != "📰":
                         continue
-                    user_level = await self._get_effective_power_level(room_id, reaction_sender)
+                    if not target_id or not rsender:
+                        continue
+                    user_level = await self._get_effective_power_level(room_id, rsender)
                     if user_level < author_pl:
                         continue
                     post = await self._get_post_internal(target_id)
@@ -1182,6 +1306,25 @@ class WebPublishBot(Plugin):
             return
 
         redacted_id = str(redacted_id)
+
+        # Reaction redaction: a reaction event's own event_id is what Matrix
+        # redacts. Check the reactions table first; if found, re-render the
+        # target's reactions strip and stop — the id is not a message.
+        reaction_entry = await self._mark_reaction_redacted(redacted_id)
+        if reaction_entry is not None:
+            target_id, target_room = reaction_entry
+            if target_room != evt.room_id:
+                return
+            reactions_html = await self._reactions_html_for_event(
+                evt.room_id, target_id,
+            )
+            self._notify_sse(evt.room_id, "reaction_removed", {
+                "event_id": target_id,
+                "element_id": safe_element_id(target_id),
+                "reactions_html": reactions_html,
+            })
+            return
+
         # Capture thread_root before the row is deleted so we can update the
         # indicator on the root message if a threaded reply was redacted.
         row = await self.database.fetchrow(
@@ -1217,41 +1360,71 @@ class WebPublishBot(Plugin):
         if evt.room_id not in self._published:
             return
         info = self._published[evt.room_id]
-        if info["mode"] != "journal":
-            return
-        if not self._get_room_config(evt.room_id, "journal_emoji_publish"):
-            return
 
         relates = evt.content.relates_to
         if not relates or str(getattr(relates, "rel_type", "")) != "m.annotation":
             return
-        if getattr(relates, "key", "") != "📰":
+        key = getattr(relates, "key", "") or ""
+        target_id = str(getattr(relates, "event_id", "") or "")
+        if not key or not target_id:
             return
 
-        author_pl = self._get_room_config(evt.room_id, "journal_author_pl")
-        user_level = await self._get_effective_power_level(evt.room_id, str(evt.sender))
-        if user_level < author_pl:
+        # Look up the target message once — used by both the publish-gate and
+        # the reactions-UI paths.
+        target = await self._get_post_internal(target_id)
+        if not target or target["room_id"] != evt.room_id:
             return
 
-        target_id = str(relates.event_id)
-        post = await self._get_post_internal(target_id)
-        if not post or post["room_id"] != evt.room_id:
-            return
-        if post["thread_root"] is not None:
-            return
-        if post["published"]:
+        # Persist every reaction. Publish-signal events are stored too; the
+        # renderer filters them out via _should_hide_publish_emoji.
+        await self._store_reaction(
+            reaction_event_id=str(evt.event_id),
+            target_event_id=target_id,
+            room_id=evt.room_id,
+            sender=str(evt.sender),
+            key=key,
+            timestamp=evt.timestamp,
+        )
+
+        journal_emoji_publish = self._get_room_config(
+            evt.room_id, "journal_emoji_publish",
+        )
+        is_publish_signal = (
+            info["mode"] == "journal"
+            and journal_emoji_publish
+            and key == "📰"
+            and target["thread_root"] is None
+        )
+
+        if is_publish_signal:
+            author_pl = self._get_room_config(evt.room_id, "journal_author_pl")
+            user_level = await self._get_effective_power_level(
+                evt.room_id, str(evt.sender),
+            )
+            if user_level >= author_pl and not target["published"]:
+                await self._publish_post(target_id)
+                comment_count = await self.database.fetchval(
+                    "SELECT COUNT(*) FROM messages "
+                    "WHERE thread_root=$1 AND redacted=FALSE",
+                    target_id,
+                ) or 0
+                # Re-fetch so we emit the post in its post-publish state.
+                published_post = await self._get_post_internal(target_id) or target
+                html = render_post_preview_html(
+                    published_post, info["alias"], comment_count,
+                )
+                self._notify_sse(evt.room_id, "new_message", {
+                    "html": html, "is_thread": False,
+                    "event_id": target_id,
+                })
+            # Publish-signal reactions are not surfaced as UI reactions.
             return
 
-        await self._publish_post(target_id)
-
-        comment_count = await self.database.fetchval(
-            "SELECT COUNT(*) FROM messages WHERE thread_root=$1 AND redacted=FALSE",
-            target_id,
-        ) or 0
-        html = render_post_preview_html(post, info["alias"], comment_count)
-        self._notify_sse(evt.room_id, "new_message", {
-            "html": html, "is_thread": False,
+        reactions_html = await self._reactions_html_for_event(evt.room_id, target_id)
+        self._notify_sse(evt.room_id, "reaction_added", {
             "event_id": target_id,
+            "element_id": safe_element_id(target_id),
+            "reactions_html": reactions_html,
         })
 
     @event.on(EventType.find(CONFIG_STATE_TYPE, t_class=EventType.Class.STATE))
@@ -1493,6 +1666,7 @@ class WebPublishBot(Plugin):
                 room_id, limit=200, top_level_only=True,
             )
             await self._enrich_reply_context(messages)
+            await self._apply_reactions_to_messages(room_id, messages)
             eids = [m["event_id"] for m in messages]
             comment_counts = await self._get_comment_counts(eids)
             thread_participants = await self._get_thread_participants(eids, 6)
@@ -1549,6 +1723,7 @@ class WebPublishBot(Plugin):
 
         comments = await self._get_thread_comments(event_id)
         await self._enrich_reply_context(comments)
+        await self._apply_reactions_to_messages(room_id, [post, *comments])
         room_name = await self._get_room_name(room_id) or (alias if alias != "/" else "")
         room_topic = await self._get_room_topic(room_id)
         room_avatar_url = await self._get_room_avatar(room_id)
@@ -1601,6 +1776,7 @@ class WebPublishBot(Plugin):
 
         comments = await self._get_thread_comments(event_id)
         await self._enrich_reply_context(comments)
+        await self._apply_reactions_to_messages(room_id, [root, *comments])
         hs = self._homeserver_url()
         html = render_thread_panel_fragment(root, comments, hs, self._base_url)
         return Response(
@@ -1637,6 +1813,7 @@ class WebPublishBot(Plugin):
         last_id = req.headers.get("Last-Event-ID")
         if last_id:
             missed = await self._get_messages_after_event(room_id, last_id)
+            await self._apply_reactions_to_messages(room_id, missed)
             for msg in missed:
                 thread_root = msg.get("thread_root")
                 if info.get("mode") == "chat" and thread_root:

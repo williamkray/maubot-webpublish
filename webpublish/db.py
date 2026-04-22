@@ -88,3 +88,25 @@ async def upgrade_v8(conn: Connection) -> None:
         "ON messages (room_id, timestamp DESC) "
         "WHERE thread_root IS NULL AND redacted = FALSE AND published = TRUE"
     )
+
+
+@upgrade_table.register(description="Add reactions table for emoji reaction aggregation")
+async def upgrade_v9(conn: Connection) -> None:
+    await conn.execute("""
+        CREATE TABLE reactions (
+            reaction_event_id TEXT PRIMARY KEY,
+            target_event_id   TEXT NOT NULL,
+            room_id           TEXT NOT NULL,
+            sender            TEXT NOT NULL,
+            key               TEXT NOT NULL,
+            timestamp         BIGINT NOT NULL,
+            redacted          BOOLEAN NOT NULL DEFAULT FALSE
+        )
+    """)
+    await conn.execute(
+        "CREATE INDEX idx_reactions_target ON reactions (target_event_id) "
+        "WHERE redacted = FALSE"
+    )
+    await conn.execute(
+        "CREATE INDEX idx_reactions_room ON reactions (room_id)"
+    )

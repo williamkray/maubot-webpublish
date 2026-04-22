@@ -47,6 +47,8 @@ Set per-room via `!webpublish chat|journal`:
 - `redact_message` — message deleted; payload has `element_id`.
 - `thread_reply` *(chat mode only)* — new threaded reply. Payload: `thread_root`, `root_element_id`, `count`, `indicator_html`, `reply_html`, `reply_element_id`. Client replaces the indicator DOM on the root and, if the thread panel is open for that root, appends the reply.
 - `thread_reply_removed` *(chat mode only)* — a threaded reply was redacted. Same payload shape as `thread_reply` but with `removed_element_id` instead of `reply_*`; `indicator_html` is empty when `count == 0`.
+- `reaction_added` — a non-control reaction was added to a tracked message. Payload: `event_id`, `element_id`, `reactions_html` (full re-rendered `<div class="webpublish-reactions">…</div>` for the target; empty string = no reactions). The 📰 publish-signal in journal mode does not emit this event.
+- `reaction_removed` — a reaction was redacted. Same payload shape as `reaction_added`; `reactions_html` is empty when the last reaction is gone.
 
 ### Media proxy
 
@@ -122,7 +124,7 @@ Any logic applied in `handle_message()` (the live event handler) **must be mirro
 Known parity points to keep in sync:
 - `published` flag: computed from `mode`, `thread_root`, and `journal_emoji_publish` config
 - `avatar_url`: fetched from `_avatar_urls` cache (populated by `_get_sender_name()`)
-- Reaction handling: `handle_reaction()` (live) vs. `pending_reactions` post-loop pass (backfill)
+- Reaction storage and 📰 publish gate: `handle_reaction()` (live) vs. `pending_reactions` post-loop pass in `_backfill_room()`. Both paths must (a) persist every `m.reaction` via `_store_reaction()` and (b) run the 📰-publish gate for top-level journal posts when `journal_emoji_publish` is true.
 
 ### Adding a message field — checklist
 
@@ -134,6 +136,8 @@ When adding a column to the `messages` table:
 4. `bot.py` backfill (`_backfill_room`) — same fetch/compute, same pass to `_store_message()`
 5. `templates.py` `render_message_html()` — read from `msg` dict if rendering it
 6. If the field affects the SSE live-update payload, update the `msg_dict` built after `_store_message()` in `handle_message()`
+
+Reactions are stored in a separate `reactions` table, not on `messages`. Hydrate them onto message dicts via `_apply_reactions_to_messages(room_id, messages)` *after* `_enrich_reply_context` and *before* calling a render function. That helper also strips 📰 from top-level journal posts when `journal_emoji_publish` is enabled.
 
 ### Feature request files
 

@@ -273,6 +273,8 @@ def render_message_html(
     else:
         avatar_img = ""
     indicator = f'    {thread_indicator_html}\n' if thread_indicator_html else ""
+    reactions_html = render_reactions_html(msg.get("reactions") or [])
+    reactions_section = f'    {reactions_html}\n' if reactions_html else ""
 
     return (
         f'<div class="webpublish-message{notice_cls}" id="{eid}">\n'
@@ -284,6 +286,7 @@ def render_message_html(
         f'      <time class="webpublish-timestamp" datetime="{iso}">{time_str}</time>{edited}\n'
         f'    </div>\n'
         f'    <div class="webpublish-body">{body_html}</div>\n'
+        f'{reactions_section}'
         f'{indicator}'
         f'  </div>\n'
         f'</div>'
@@ -309,6 +312,24 @@ def _render_mini_avatar(participant: dict, homeserver_url: str, proxy_base_url: 
         f'<span class="webpublish-thread-avatar" style="background-color:{color}"'
         f' title="{title}">{initials}{img}</span>'
     )
+
+
+def render_reactions_html(reactions: list[dict]) -> str:
+    if not reactions:
+        return ""
+    pills: list[str] = []
+    for r in reactions:
+        senders = r.get("senders") or []
+        title = escape(", ".join(senders))
+        key = escape(r.get("key", ""))
+        count = int(r.get("count", 0))
+        pills.append(
+            f'<span class="webpublish-reaction" title="{title}">'
+            f'<span class="webpublish-reaction-key">{key}</span>'
+            f'<span class="webpublish-reaction-count">{count}</span>'
+            f'</span>'
+        )
+    return f'<div class="webpublish-reactions">{"".join(pills)}</div>'
 
 
 def render_thread_indicator_html(
@@ -676,6 +697,21 @@ a:hover { text-decoration: underline; }
 }
 .webpublish-thread-count { font-size: 0.8rem; font-weight: 500; }
 
+/* ---- reactions ---- */
+.webpublish-reactions {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  margin-top: 6px;
+}
+.webpublish-reaction {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px;
+  background: var(--bg-secondary); border: 1px solid var(--border);
+  border-radius: 12px; font-size: 0.8rem; line-height: 1.4;
+  color: var(--text);
+}
+.webpublish-reaction-key { font-size: 0.95rem; line-height: 1; }
+.webpublish-reaction-count { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
 .webpublish-thread-panel {
   position: fixed; top: 0; right: 0; bottom: 0;
   width: min(420px, 40vw);
@@ -867,6 +903,19 @@ def _sse_chat_script(encoded_alias: str) -> str:
         '        \' <span class="webpublish-edited">(edited)</span>\');\n'
         '    }\n'
         '  }\n'
+        '  function applyReactions(el, html) {\n'
+        '    if (!el) return;\n'
+        '    var content = el.querySelector(".webpublish-message-content") || el;\n'
+        '    var existing = content.querySelector(".webpublish-reactions");\n'
+        '    if (html) {\n'
+        '      if (existing) { existing.outerHTML = html; return; }\n'
+        '      var body = content.querySelector(".webpublish-body");\n'
+        '      if (body) body.insertAdjacentHTML("afterend", html);\n'
+        '      else content.insertAdjacentHTML("beforeend", html);\n'
+        '    } else if (existing) {\n'
+        '      existing.remove();\n'
+        '    }\n'
+        '  }\n'
         '  scrollBottom();\n'
         f'  var src = new EventSource("{sse_url}");\n'
         '  src.addEventListener("new_message", function(e) {\n'
@@ -929,6 +978,16 @@ def _sse_chat_script(encoded_alias: str) -> str:
         '    if (el) el.remove();\n'
         '    var p = findInPanel(d.element_id);\n'
         '    if (p) p.remove();\n'
+        '  });\n'
+        '  function applyReactionsBoth(d) {\n'
+        '    applyReactions(document.getElementById(d.element_id), d.reactions_html);\n'
+        '    applyReactions(findInPanel(d.element_id), d.reactions_html);\n'
+        '  }\n'
+        '  src.addEventListener("reaction_added", function(e) {\n'
+        '    applyReactionsBoth(JSON.parse(e.data));\n'
+        '  });\n'
+        '  src.addEventListener("reaction_removed", function(e) {\n'
+        '    applyReactionsBoth(JSON.parse(e.data));\n'
         '  });\n'
         '})();\n'
         '</script>'
@@ -1051,9 +1110,30 @@ def _sse_post_detail_script(post_event_id: str) -> str:
         '(function() {\n'
         '  var base = window.location.pathname.replace(/\\/post\\/[^\\/]*$/, "");\n'
         '  var src = new EventSource(base + "/sse");\n'
+        f'  var postId = "{escape(post_event_id)}";\n'
+        '  function applyReactions(el, html) {\n'
+        '    if (!el) return;\n'
+        '    var scope = el.classList.contains("webpublish-message")\n'
+        '      ? (el.querySelector(".webpublish-message-content") || el) : el;\n'
+        '    var existing = scope.querySelector(":scope > .webpublish-reactions");\n'
+        '    if (!existing) existing = scope.querySelector(".webpublish-reactions");\n'
+        '    if (html) {\n'
+        '      if (existing) { existing.outerHTML = html; return; }\n'
+        '      var body = scope.querySelector(".webpublish-body, .webpublish-post-body");\n'
+        '      if (body) body.insertAdjacentHTML("afterend", html);\n'
+        '      else scope.insertAdjacentHTML("beforeend", html);\n'
+        '    } else if (existing) {\n'
+        '      existing.remove();\n'
+        '    }\n'
+        '  }\n'
+        '  function findPostOrComment(eventElementId) {\n'
+        '    var byId = document.getElementById(eventElementId);\n'
+        '    if (byId) return byId;\n'
+        '    return null;\n'
+        '  }\n'
         '  src.addEventListener("new_message", function(e) {\n'
         '    var d = JSON.parse(e.data);\n'
-        f'    if (d.thread_root !== "{escape(post_event_id)}") return;\n'
+        '    if (d.thread_root !== postId) return;\n'
         '    var el = document.getElementById("comments");\n'
         '    if (el) {\n'
         '      el.insertAdjacentHTML("beforeend", d.html);\n'
@@ -1073,6 +1153,18 @@ def _sse_post_detail_script(post_event_id: str) -> str:
         '    var el = document.getElementById(d.element_id);\n'
         '    if (el) el.remove();\n'
         '  });\n'
+        '  function handleReactions(e) {\n'
+        '    var d = JSON.parse(e.data);\n'
+        '    if (d.event_id === postId) {\n'
+        '      var article = document.querySelector(".webpublish-post-full article");\n'
+        '      if (article) applyReactions(article, d.reactions_html);\n'
+        '      return;\n'
+        '    }\n'
+        '    var el = findPostOrComment(d.element_id);\n'
+        '    if (el) applyReactions(el, d.reactions_html);\n'
+        '  }\n'
+        '  src.addEventListener("reaction_added", handleReactions);\n'
+        '  src.addEventListener("reaction_removed", handleReactions);\n'
         '})();\n'
         '</script>'
     )
@@ -1319,6 +1411,9 @@ def render_journal_post(
     tags_html = render_tag_chips(tags, encoded_alias, proxy_base_url)
     tags_section = f'\n    {tags_html}' if tags_html else ""
 
+    post_reactions_html = render_reactions_html(post.get("reactions") or [])
+    post_reactions_section = f'    {post_reactions_html}\n' if post_reactions_html else ""
+
     comments_parts = [
         render_message_html(
             c, homeserver_url, proxy_base_url,
@@ -1354,12 +1449,13 @@ def render_journal_post(
         f'    </div>\n'
         f'{tags_section}\n'
         f'    <div class="webpublish-post-body">{body_html}</div>\n'
+        f'{post_reactions_section}'
         f'  </article>\n'
-        f'  <div class="webpublish-matrix-reply-link">\n'
-        f'    <a href="{matrix_link}" target="_blank" rel="noopener noreferrer">Reply in Matrix</a>\n'
-        f'  </div>\n'
         f'  <section class="webpublish-comments">\n'
         f'    <h2>{label}</h2>\n'
+        f'    <div class="webpublish-matrix-reply-link">\n'
+        f'      <a href="{matrix_link}" target="_blank" rel="noopener noreferrer">Reply in Matrix</a>\n'
+        f'    </div>\n'
         f'    <div id="comments">\n{comments_html}\n    </div>\n'
         f'  </section>\n'
         f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n{scroll_script}\n</body>\n</html>'
