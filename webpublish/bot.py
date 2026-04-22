@@ -726,24 +726,27 @@ class WebPublishBot(Plugin):
         except Exception:
             pass  # no encryption state = not encrypted
 
-        # require a canonical alias
-        try:
-            alias_evt = await self.client.get_state_event(
-                room_id, EventType.ROOM_CANONICAL_ALIAS
-            )
-            alias = alias_evt.canonical_alias
-            if not alias:
-                raise ValueError("empty alias")
-        except Exception:
-            await evt.reply(
-                "This room must have a canonical alias set before publishing."
-            )
-            return
+        existing = self._published.get(room_id)
+        if existing:
+            alias_str = existing["alias"]
+        else:
+            try:
+                alias_evt = await self.client.get_state_event(
+                    room_id, EventType.ROOM_CANONICAL_ALIAS
+                )
+                alias = alias_evt.canonical_alias
+                if not alias:
+                    raise ValueError("empty alias")
+            except Exception:
+                await evt.reply(
+                    "This room must have a canonical alias set before publishing."
+                )
+                return
+            alias_str = str(alias).lstrip("#")
 
-        alias_str = str(alias).lstrip("#")
         await self._set_published(room_id, mode, alias_str)
 
-        url = f"{self._base_url}/{alias_str}"
+        url = f"{self._base_url}/" if alias_str == "/" else f"{self._base_url}/{alias_str}"
         await evt.reply(f"Room published in **{mode}** mode!\n\n{url}")
 
         # backfill in background
