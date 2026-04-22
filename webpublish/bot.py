@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 from collections import OrderedDict
-from typing import Type
+from typing import Any, Callable, Type
 from urllib.parse import unquote
 
 from aiohttp.web import Request, Response, StreamResponse
@@ -39,6 +39,31 @@ _HTML_CACHE_CONTROL = "public, max-age=60, stale-while-revalidate=600"
 # video eviction-thrashing everything else.
 _MEDIA_STREAM_THRESHOLD = 2 * 1024 * 1024
 _MEDIA_CACHE_CONTROL = "public, max-age=86400"
+
+# Matrix state event type used to store per-room config overrides.
+CONFIG_STATE_TYPE = "org.jobmachine.webpublish.config"
+
+
+def _parse_bool(s: str) -> bool:
+    low = s.strip().lower()
+    if low in ("true", "yes", "1", "on"):
+        return True
+    if low in ("false", "no", "0", "off"):
+        return False
+    raise ValueError(f"expected true/false, got {s!r}")
+
+
+# Config keys that can be overridden per-room, mapped to their value parsers.
+# `base_url` is intentionally excluded — it's infrastructure-level, not per-room.
+OVERRIDABLE_CONFIG: dict[str, Callable[[str], Any]] = {
+    "css": str,
+    "pagination": int,
+    "max_backfill": int,
+    "min_power_level": int,
+    "journal_author_pl": int,
+    "journal_emoji_publish": _parse_bool,
+    "journal_enforce_messages": _parse_bool,
+}
 
 
 class Config(BaseProxyConfig):
@@ -81,6 +106,7 @@ class WebPublishBot(Plugin):
         self._tile_cache: OrderedDict[str, bytes] = OrderedDict()
         self._tile_cache_max: int = 256
         self._room_create_cache: dict[str, tuple[int, set[str]]] = {}
+        self._room_config_overrides: dict[str, dict[str, Any]] = {}
         await self._load_published_rooms()
 
     async def stop(self) -> None:
@@ -108,6 +134,7 @@ class WebPublishBot(Plugin):
             if default_alias != alias:
                 self._alias_to_room[default_alias] = rid
                 self._redirect_aliases[default_alias] = alias
+            self._room_config_overrides[rid] = await self._fetch_room_overrides(rid)
 
     async def _set_published(self, room_id: str, mode: str, alias: str) -> None:
         old = self._published.get(room_id)
@@ -430,9 +457,35 @@ class WebPublishBot(Plugin):
 
         return user_level
 
+    def _get_room_config(self, room_id: str | None, key: str) -> Any:
+        """Return the effective config value for a room, preferring per-room overrides."""
+        if room_id:
+            overrides = self._room_config_overrides.get(room_id)
+            if overrides and key in overrides:
+                return overrides[key]
+        return self.config[key]
+
+    async def _fetch_room_overrides(self, room_id: str) -> dict[str, Any]:
+        try:
+            content = await self.client.api.request(
+                Method.GET,
+                Path.v3.rooms[room_id].state[CONFIG_STATE_TYPE],
+            )
+        except Exception as e:
+            self.log.debug(f"no room config overrides for {room_id}: {e}")
+            return {}
+        return content if isinstance(content, dict) else {}
+
+    async def _put_room_overrides(self, room_id: str, overrides: dict[str, Any]) -> None:
+        await self.client.send_state_event(
+            room_id,
+            EventType.find(CONFIG_STATE_TYPE, t_class=EventType.Class.STATE),
+            overrides,
+        )
+
     async def _check_power_level(self, evt: MessageEvent) -> bool:
         """Return True if the sender meets the configured min_power_level."""
-        required = self.config["min_power_level"]
+        required = self._get_room_config(evt.room_id, "min_power_level")
         user_level = await self._get_effective_power_level(evt.room_id, str(evt.sender))
         if user_level < required:
             await evt.reply(
@@ -582,6 +635,81 @@ class WebPublishBot(Plugin):
         url = f"{self._base_url}/" if alias == "/" else f"{self._base_url}/{alias}"
         await evt.reply(f"URI updated! Site now available at {url}")
 
+    @webpublish.subcommand("config", help="Set or view per-room config overrides")
+    @command.argument("args", pass_raw=True, required=False)
+    async def config_cmd(self, evt: MessageEvent, args: str) -> None:
+        if not await self._check_power_level(evt):
+            return
+        args = (args or "").strip()
+        overrides = self._room_config_overrides.get(evt.room_id, {})
+
+        if not args:
+            lines = []
+            for k in sorted(OVERRIDABLE_CONFIG):
+                if k in overrides:
+                    lines.append(f"- `{k}` *(override)*: `{json.dumps(overrides[k])}`")
+                else:
+                    lines.append(f"- `{k}`: `{json.dumps(self.config[k])}` (default)")
+            body = (
+                "Per-room config values (effective for this room):\n"
+                + "\n".join(lines)
+                + "\n\nSet with `!webpublish config <key> <value>`. "
+                "Clear an override with `!webpublish config <key> \"\"`."
+            )
+            await evt.reply(body)
+            return
+
+        parts = args.split(None, 1)
+        key = parts[0]
+
+        if key not in OVERRIDABLE_CONFIG:
+            valid = ", ".join(sorted(OVERRIDABLE_CONFIG))
+            await evt.reply(f"Unknown config key `{key}`. Overridable keys: {valid}.")
+            return
+
+        if len(parts) == 1:
+            if key in overrides:
+                await evt.reply(f"`{key}` (override): `{json.dumps(overrides[key])}`")
+            else:
+                default = self.config[key]
+                await evt.reply(
+                    f"`{key}`: not overridden (using bot default: `{json.dumps(default)}`)"
+                )
+            return
+
+        raw_value = parts[1].strip()
+        new_overrides = dict(overrides)
+
+        if raw_value in ("", '""', "''"):
+            if key not in new_overrides:
+                await evt.reply(f"No override to clear for `{key}`.")
+                return
+            new_overrides.pop(key)
+            try:
+                await self._put_room_overrides(evt.room_id, new_overrides)
+            except Exception as e:
+                await evt.reply(f"Failed to update room state: {e}")
+                return
+            self._room_config_overrides[evt.room_id] = new_overrides
+            await evt.reply(f"Cleared override for `{key}`; reverted to bot default.")
+            return
+
+        parser = OVERRIDABLE_CONFIG[key]
+        try:
+            value = parser(raw_value)
+        except Exception as e:
+            await evt.reply(f"Invalid value for `{key}`: {e}")
+            return
+
+        new_overrides[key] = value
+        try:
+            await self._put_room_overrides(evt.room_id, new_overrides)
+        except Exception as e:
+            await evt.reply(f"Failed to update room state: {e}")
+            return
+        self._room_config_overrides[evt.room_id] = new_overrides
+        await evt.reply(f"Set `{key}` = `{json.dumps(value)}` for this room.")
+
     async def _publish_room(self, evt: MessageEvent, mode: str) -> None:
         room_id = evt.room_id
 
@@ -636,13 +764,13 @@ class WebPublishBot(Plugin):
             self._backfilling.discard(room_id)
 
     async def _backfill_room_inner(self, room_id: str) -> None:
-        max_msgs = self.config["max_backfill"]
+        max_msgs = self._get_room_config(room_id, "max_backfill")
         total = 0
         end_token: str | None = None
         info = self._published.get(room_id, {})
         is_journal_emoji = (
             info.get("mode") == "journal"
-            and self.config["journal_emoji_publish"]
+            and self._get_room_config(room_id, "journal_emoji_publish")
         )
         pending_reactions: list[tuple[str, str]] = []  # (sender, target_event_id)
         pending_edits: dict[str, tuple[str, str | None]] = {}  # target_event_id -> (body, formatted_body)
@@ -745,7 +873,7 @@ class WebPublishBot(Plugin):
 
             # Apply 📰 reactions collected during backfill
             if pending_reactions:
-                author_pl = self.config["journal_author_pl"]
+                author_pl = self._get_room_config(room_id, "journal_author_pl")
                 for reaction_sender, target_id in pending_reactions:
                     if not target_id or not reaction_sender:
                         continue
@@ -834,8 +962,8 @@ class WebPublishBot(Plugin):
         if info["mode"] == "journal" and thread_root is None:
             if str(content.msgtype) == "m.notice":
                 return
-            if self.config["journal_enforce_messages"]:
-                author_pl = self.config["journal_author_pl"]
+            if self._get_room_config(evt.room_id, "journal_enforce_messages"):
+                author_pl = self._get_room_config(evt.room_id, "journal_author_pl")
                 user_level = await self._get_effective_power_level(
                     evt.room_id, str(evt.sender)
                 )
@@ -875,7 +1003,7 @@ class WebPublishBot(Plugin):
         published = not (
             info["mode"] == "journal"
             and thread_root is None
-            and self.config["journal_emoji_publish"]
+            and self._get_room_config(evt.room_id, "journal_emoji_publish")
         )
 
         await self._store_message(
@@ -963,7 +1091,7 @@ class WebPublishBot(Plugin):
         info = self._published[evt.room_id]
         if info["mode"] != "journal":
             return
-        if not self.config["journal_emoji_publish"]:
+        if not self._get_room_config(evt.room_id, "journal_emoji_publish"):
             return
 
         relates = evt.content.relates_to
@@ -972,7 +1100,7 @@ class WebPublishBot(Plugin):
         if getattr(relates, "key", "") != "📰":
             return
 
-        author_pl = self.config["journal_author_pl"]
+        author_pl = self._get_room_config(evt.room_id, "journal_author_pl")
         user_level = await self._get_effective_power_level(evt.room_id, str(evt.sender))
         if user_level < author_pl:
             return
@@ -997,6 +1125,18 @@ class WebPublishBot(Plugin):
             "html": html, "is_thread": False,
             "event_id": target_id,
         })
+
+    @event.on(EventType.find(CONFIG_STATE_TYPE, t_class=EventType.Class.STATE))
+    async def handle_config_state(self, evt) -> None:
+        # State-key must be empty for our override event; ignore anything else.
+        if getattr(evt, "state_key", "") != "":
+            return
+        content = evt.content
+        if hasattr(content, "serialize"):
+            content = content.serialize()
+        if not isinstance(content, dict):
+            content = {}
+        self._room_config_overrides[evt.room_id] = dict(content)
 
     # ------------------------------------------------------------------
     # Web handlers
@@ -1155,7 +1295,7 @@ class WebPublishBot(Plugin):
         room_avatar_url = await self._get_room_avatar(room_id)
         tags = await self._get_tag_counts(room_id)
         encoded = "" if alias == "/" else alias
-        html = render_tag_index_page(room_name, tags, encoded, self.config["css"], self._base_url, room_avatar_url=room_avatar_url)
+        html = render_tag_index_page(room_name, tags, encoded, self._get_room_config(room_id, "css"), self._base_url, room_avatar_url=room_avatar_url)
         return Response(text=html, content_type="text/html",
                         headers={"Cache-Control": _HTML_CACHE_CONTROL})
 
@@ -1177,7 +1317,7 @@ class WebPublishBot(Plugin):
         if info.get("mode") != "journal":
             return Response(status=404, text="Not a journal room")
         page = int(req.query.get("page", "1"))
-        per_page = self.config["pagination"]
+        per_page = self._get_room_config(room_id, "pagination")
         posts, total_pages = await self._get_posts_by_tag(room_id, tag.lower(), page, per_page)
         eids = [p["event_id"] for p in posts]
         counts = await self._get_comment_counts(eids)
@@ -1189,7 +1329,7 @@ class WebPublishBot(Plugin):
         encoded = "" if alias == "/" else alias
         html = render_tag_filter_page(
             room_name, tag.lower(), posts, encoded, page, total_pages,
-            self.config["css"], counts, self._base_url,
+            self._get_room_config(room_id, "css"), counts, self._base_url,
             room_avatar_url=room_avatar_url,
         )
         return Response(text=html, content_type="text/html",
@@ -1217,7 +1357,7 @@ class WebPublishBot(Plugin):
         room_topic = await self._get_room_topic(room_id)
         room_avatar_url = await self._get_room_avatar(room_id)
         hs = self._homeserver_url()
-        css = self.config["css"]
+        css = self._get_room_config(room_id, "css")
         encoded = "" if alias == "/" else alias
 
         if info["mode"] == "chat":
@@ -1229,7 +1369,7 @@ class WebPublishBot(Plugin):
             )
         else:
             page = int(req.query.get("page", "1"))
-            per_page = self.config["pagination"]
+            per_page = self._get_room_config(room_id, "pagination")
             posts, total_pages = await self._get_posts(room_id, page, per_page)
             eids = [p["event_id"] for p in posts]
             counts = await self._get_comment_counts(eids)
@@ -1278,7 +1418,7 @@ class WebPublishBot(Plugin):
         room_topic = await self._get_room_topic(room_id)
         room_avatar_url = await self._get_room_avatar(room_id)
         hs = self._homeserver_url()
-        css = self.config["css"]
+        css = self._get_room_config(room_id, "css")
         encoded = "" if alias == "/" else alias
         post["tags"] = await self._get_tags_for_post(event_id)
 

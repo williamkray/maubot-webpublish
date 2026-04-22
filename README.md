@@ -76,6 +76,25 @@ a plain-text excerpt, the publish date, the author name, and (when the post cont
 `link` will return the website url of the room, or simply `this room is not published` if publishing is not
 enabled.
 
+## per-room configuration overrides
+
+room admins can override most plugin config values on a per-room basis with `!webpublish config`:
+
+```
+!webpublish config css @import url("https://example.com/theme.css");
+!webpublish config journal_enforce_messages true
+!webpublish config pagination 25
+```
+
+- running `!webpublish config` with no arguments lists the current overrides for the room.
+- `!webpublish config <key>` (key only) shows one override or reports that the bot default is in use.
+- passing an empty value (`!webpublish config css ""`) removes the override and reverts to the bot default.
+
+overrides are stored as a Matrix state event of type `org.jobmachine.webpublish.config` on the room, so they survive
+rebuilds and are inspectable through any Matrix client. overridable keys: `css`, `pagination`, `max_backfill`,
+`min_power_level`, `journal_author_pl`, `journal_emoji_publish`, `journal_enforce_messages`. `base_url` is not
+overridable — it's instance-wide infrastructure.
+
 # standalone quickstart
 
 you can run this bot without a full maubot deployment using the included docker compose setup.
