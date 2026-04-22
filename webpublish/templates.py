@@ -455,9 +455,18 @@ a:hover { text-decoration: underline; }
   max-height: 6rem; overflow: hidden;
   transition: max-height 0.25s ease, opacity 0.25s ease, margin-top 0.25s ease;
 }
+.webpublish-topic-toggle {
+  display: none;
+  background: none; border: 0; padding: 0;
+  color: var(--accent); cursor: pointer; font: inherit;
+  margin-top: 4px; text-decoration: underline;
+}
 @media (max-width: 600px) {
-  .webpublish-header.scrolled { padding: 10px 32px; cursor: pointer; }
-  .webpublish-header.scrolled p { max-height: 0; opacity: 0; margin-top: 0; }
+  .webpublish-header.scrolled:not(.expanded) { padding: 10px 32px; cursor: pointer; }
+  .webpublish-header.scrolled:not(.expanded) p { max-height: 0; opacity: 0; margin-top: 0; }
+  .webpublish-header.expanded p { max-height: 50vh; overflow-y: auto; }
+  .webpublish-topic-toggle:not([hidden]) { display: inline-block; }
+  .webpublish-header.scrolled:not(.expanded) .webpublish-topic-toggle { display: none; }
 }
 
 /* ---- chat mode ---- */
@@ -814,25 +823,51 @@ def _scroll_header_script() -> str:
         '(function() {\n'
         '  var header = document.querySelector(".webpublish-header");\n'
         '  if (!header) return;\n'
+        '  var topic = header.querySelector("p");\n'
+        '  var toggle = header.querySelector(".webpublish-topic-toggle");\n'
         '  var mq = window.matchMedia("(max-width: 600px)");\n'
         '  var scroller = document.getElementById("messages") || window;\n'
         '  function getScrollY() {\n'
         '    return scroller === window ? window.scrollY : scroller.scrollTop;\n'
         '  }\n'
         '  function update() {\n'
+        '    if (header.classList.contains("expanded")) {\n'
+        '      header.classList.remove("scrolled");\n'
+        '      return;\n'
+        '    }\n'
         '    if (mq.matches && getScrollY() > 10) {\n'
         '      header.classList.add("scrolled");\n'
         '    } else {\n'
         '      header.classList.remove("scrolled");\n'
         '    }\n'
         '  }\n'
+        '  function checkOverflow() {\n'
+        '    if (!topic || !toggle) return;\n'
+        '    if (!mq.matches) { toggle.hidden = true; return; }\n'
+        '    var wasExpanded = header.classList.contains("expanded");\n'
+        '    if (wasExpanded) header.classList.remove("expanded");\n'
+        '    var overflowing = topic.scrollHeight - 1 > topic.clientHeight;\n'
+        '    if (wasExpanded) header.classList.add("expanded");\n'
+        '    toggle.hidden = !overflowing;\n'
+        '  }\n'
         '  scroller.addEventListener("scroll", update, {passive: true});\n'
-        '  mq.addEventListener("change", update);\n'
+        '  mq.addEventListener("change", function() { checkOverflow(); update(); });\n'
+        '  window.addEventListener("resize", checkOverflow, {passive: true});\n'
         '  header.addEventListener("click", function() {\n'
         '    if (header.classList.contains("scrolled")) {\n'
         '      scroller.scrollTo({top: 0, behavior: "smooth"});\n'
         '    }\n'
         '  });\n'
+        '  if (toggle) {\n'
+        '    toggle.addEventListener("click", function(e) {\n'
+        '      e.stopPropagation();\n'
+        '      var expanded = header.classList.toggle("expanded");\n'
+        '      toggle.setAttribute("aria-expanded", expanded ? "true" : "false");\n'
+        '      toggle.textContent = expanded ? "Show less" : "Show more";\n'
+        '      update();\n'
+        '    });\n'
+        '  }\n'
+        '  checkOverflow();\n'
         '})();\n'
         '</script>'
     )
@@ -865,7 +900,10 @@ def render_chat_page(
     has_maps = _needs_leaflet(messages)
     head = _page_head(room_name, custom_css, extra_head=_LEAFLET_HEAD_ASSETS if has_maps else "")
     msgs_html = "\n".join(render_message_html(m, homeserver_url, proxy_base_url) for m in messages)
-    topic_p = f"  <p>{escape(room_topic)}</p>" if room_topic else ""
+    topic_p = (
+        f"  <p>{escape(room_topic)}</p>\n"
+        f'  <button class="webpublish-topic-toggle" type="button" aria-expanded="false" hidden>Show more</button>'
+    ) if room_topic else ""
     sse = _sse_chat_script(encoded_alias)
     leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
     scroll_script = _scroll_header_script()
@@ -895,7 +933,10 @@ def render_journal_landing(
 ) -> str:
     og = _og_meta_site(room_name, room_topic, encoded_alias, base_url, room_avatar_url, base_url) if base_url else ""
     head = _page_head(room_name, custom_css, og_meta=og)
-    topic_p = f"  <p>{escape(room_topic)}</p>" if room_topic else ""
+    topic_p = (
+        f"  <p>{escape(room_topic)}</p>\n"
+        f'  <button class="webpublish-topic-toggle" type="button" aria-expanded="false" hidden>Show more</button>'
+    ) if room_topic else ""
 
     posts_parts = []
     for post in posts:
@@ -978,7 +1019,10 @@ def render_journal_post(
     scroll_script = _scroll_header_script()
     back_href = "../" if not encoded_alias else f"../../{encoded_alias}"
     avatar_img = _render_room_avatar_img(room_avatar_url, proxy_base_url)
-    topic_p = f"  <p>{escape(room_topic)}</p>" if room_topic else ""
+    topic_p = (
+        f"  <p>{escape(room_topic)}</p>\n"
+        f'  <button class="webpublish-topic-toggle" type="button" aria-expanded="false" hidden>Show more</button>'
+    ) if room_topic else ""
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
