@@ -578,6 +578,11 @@ a:hover { text-decoration: underline; }
   background: var(--accent); color: #fff; border-color: var(--accent);
 }
 .webpublish-back-link { display: inline-block; margin-bottom: 16px; }
+.webpublish-feed-footer {
+  text-align: center; padding: 16px 0 32px; font-size: 0.85rem; color: var(--text-muted);
+}
+.webpublish-feed-footer a { color: var(--text-muted); }
+.webpublish-feed-footer a:hover { color: var(--accent); }
 .webpublish-map { position: relative; border-radius: 8px; overflow: hidden; }
 """
 
@@ -889,6 +894,12 @@ def render_journal_landing(
         if pag_parts else ""
     )
 
+    feed_url = f"{base_url}/feed.xml" if not encoded_alias else f"{base_url}/{encoded_alias}/feed.xml"
+    feed_footer = (
+        f'  <div class="webpublish-feed-footer">'
+        f'<a href="{escape(feed_url)}">&#x2605; Atom feed</a></div>\n'
+    ) if base_url else ""
+
     sse = _sse_journal_landing_script(encoded_alias)
     scroll_script = _scroll_header_script()
     return (
@@ -899,6 +910,7 @@ def render_journal_landing(
         f'<main class="webpublish-journal">\n'
         f'  <div class="webpublish-posts">\n{posts_html}\n  </div>\n'
         f'  {pag_html}\n'
+        f'{feed_footer}'
         f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{sse}\n{scroll_script}\n</body>\n</html>'
     )
 
@@ -1091,6 +1103,12 @@ def render_tag_filter_page(
         if pag_parts else ""
     )
 
+    feed_url = f"{base_url}/feed.xml" if not encoded_alias else f"{base_url}/{encoded_alias}/feed.xml"
+    feed_footer = (
+        f'  <div class="webpublish-feed-footer">'
+        f'<a href="{escape(feed_url)}">&#x2605; Atom feed</a></div>\n'
+    ) if base_url else ""
+
     scroll_script = _scroll_header_script()
     return (
         f'{head}\n<body>\n'
@@ -1102,5 +1120,6 @@ def render_tag_filter_page(
         f'  <h2 class="webpublish-tag-header">#{escape(tag)}</h2>\n'
         f'  <div class="webpublish-posts">\n{posts_html}\n  </div>\n'
         f'  {pag_html}\n'
+        f'{feed_footer}'
         f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{scroll_script}\n</body>\n</html>'
     )
