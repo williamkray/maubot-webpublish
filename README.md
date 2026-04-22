@@ -35,6 +35,42 @@ section on that post. how you control the people in your room is an exercise lef
 to publish a blog right from a matrix room! the landing page list of entries will default to paginating every 10 entries
 but you can configure this.
 
+journal rooms also expose several additional pages and features described below.
+
+## journal features
+
+### hashtags
+
+write `#tagname` anywhere in a post body to tag it. tags must start with a letter and contain only letters, numbers,
+hyphens, and underscores (Matrix room aliases like `#room:server` are ignored). tags are indexed at publish time and
+updated when posts are edited.
+
+two tag pages are available:
+
+- `/{alias}/tags` — lists all tags used in the room with post counts
+- `/{alias}/tag/{name}` — shows all posts with a given tag, paginated
+
+tag chips appear on post preview cards and on individual post pages. a `!webpublish rebuild` will re-index all tags
+from existing posts.
+
+### atom feed
+
+journal rooms expose an Atom 1.0 feed at:
+
+```
+/{alias}/feed.xml
+```
+
+this contains the 20 most recent published posts and is compatible with any RSS reader (Feedly, NetNewsWire, etc.).
+
+### social sharing (open graph)
+
+the journal landing page and each post detail page include `<meta property="og:*">` tags so that links shared on
+Mastodon, Slack, iMessage, and similar platforms generate rich preview cards. post detail pages include the post title,
+a plain-text excerpt, the publish date, the author name, and (when the post contains an image) an `og:image`.
+
+---
+
 `disable` will stop publishing the site if you have already published it.
 
 `link` will return the website url of the room, or simply `this room is not published` if publishing is not
@@ -107,6 +143,12 @@ elsewhere for a cleaner config, or write out your custom css here. relevant css 
 - `.webpublish-comments` — comments section on a post
 - `.webpublish-pagination` — page navigation controls
 - `.webpublish-back-link` — "back to posts" link
+- `.webpublish-tags` — tag chip row (on post previews and post detail)
+- `.webpublish-tag-chip` — individual tag link pill
+- `.webpublish-tag-header` — heading on tag index and tag filter pages
+- `.webpublish-tag-list` — tag list on the tag index page
+- `.webpublish-figure-full` — full-width image figure in journal post body
+- `.webpublish-image-body` — prose content below a journal image post
 
 css custom properties (variables) that control the color scheme:
 

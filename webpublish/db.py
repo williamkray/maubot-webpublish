@@ -62,3 +62,18 @@ async def upgrade_v5(conn: Connection) -> None:
 async def upgrade_v6(conn: Connection) -> None:
     await conn.execute("ALTER TABLE published_rooms ADD COLUMN default_alias TEXT")
     await conn.execute("UPDATE published_rooms SET default_alias = alias")
+
+
+@upgrade_table.register(description="Add post_tags table for hashtag indexing")
+async def upgrade_v7(conn: Connection) -> None:
+    await conn.execute("""
+        CREATE TABLE post_tags (
+            event_id TEXT NOT NULL REFERENCES messages(event_id) ON DELETE CASCADE,
+            room_id  TEXT NOT NULL,
+            tag      TEXT NOT NULL,
+            PRIMARY KEY (event_id, tag)
+        )
+    """)
+    await conn.execute(
+        "CREATE INDEX idx_post_tags_room_tag ON post_tags (room_id, tag)"
+    )

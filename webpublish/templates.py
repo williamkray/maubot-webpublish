@@ -103,6 +103,13 @@ _SENDER_COLORS = [
     "#e040fb", "#00e5ff", "#76ff03", "#ffd740",
 ]
 
+# Matches #hashtags; rejects Matrix room aliases (#room:server) via lookahead
+_HASHTAG_RE = re.compile(r'(?<![&\w])#([a-zA-Z][a-zA-Z0-9_-]{0,49})(?![:\w])')
+
+
+def parse_hashtags(body: str) -> list[str]:
+    return sorted({t.lower() for t in _HASHTAG_RE.findall(body)})
+
 
 def sender_color(mxid: str) -> str:
     h = int(hashlib.md5(mxid.encode()).hexdigest(), 16)
@@ -150,7 +157,7 @@ def mxc_to_http(mxc_url: str, homeserver_url: str, proxy_base_url: str = "") -> 
 # Message body rendering
 # ---------------------------------------------------------------------------
 
-def render_body(msg: dict, homeserver_url: str, proxy_base_url: str = "") -> str:
+def render_body(msg: dict, homeserver_url: str, proxy_base_url: str = "", journal: bool = False) -> str:
     if msg.get("redacted"):
         return '<em class="webpublish-redacted">this message was deleted</em>'
 
@@ -160,16 +167,26 @@ def render_body(msg: dict, homeserver_url: str, proxy_base_url: str = "") -> str
         url = mxc_to_http(msg.get("media_url", ""), homeserver_url, proxy_base_url)
         body_text = msg.get("body", "")
         alt = escape(body_text or "image")
-        # Show body as caption if it looks like prose rather than a bare filename
-        # (filenames have no spaces and end in a file extension)
         is_filename = bool(re.fullmatch(r'[^\s]+\.[a-zA-Z0-9]{2,5}', body_text or ""))
-        caption = "" if is_filename else escape(body_text)
         if url:
             img = f'<img class="webpublish-media" src="{escape(url)}" alt="{alt}" loading="lazy">'
             linked = f'<a href="{escape(url)}" target="_blank" rel="noopener">{img}</a>'
-            if caption:
-                return f'<figure class="webpublish-figure">{linked}<figcaption>{caption}</figcaption></figure>'
-            return linked
+            if journal:
+                # Journal posts: image displayed full-width, body rendered as prose below
+                formatted = msg.get("formatted_body")
+                if formatted:
+                    text_block = f'<div class="webpublish-image-body">{sanitize_html(formatted)}</div>'
+                elif not is_filename:
+                    text_block = f'<div class="webpublish-image-body">{escape(body_text).replace(chr(10), "<br>")}</div>'
+                else:
+                    text_block = ""
+                figure = f'<figure class="webpublish-figure webpublish-figure-full">{linked}</figure>'
+                return figure + ("\n" + text_block if text_block else "")
+            else:
+                caption = "" if is_filename else escape(body_text)
+                if caption:
+                    return f'<figure class="webpublish-figure">{linked}<figcaption>{caption}</figcaption></figure>'
+                return linked
         return f"[image: {alt}]"
 
     if msgtype == "m.file":
@@ -265,7 +282,23 @@ def render_message_html(msg: dict, homeserver_url: str, proxy_base_url: str = ""
     )
 
 
-def render_post_preview_html(post: dict, alias: str, comment_count: int) -> str:
+def render_tag_chips(tags: list[str], encoded_alias: str, base_url: str = "") -> str:
+    if not tags:
+        return ""
+    chips = []
+    for tag in tags:
+        tag_path = f"tag/{quote(tag, safe='')}"
+        if base_url:
+            url = f"{base_url}/{encoded_alias}/{tag_path}" if encoded_alias else f"{base_url}/{tag_path}"
+        elif encoded_alias:
+            url = f"./{encoded_alias}/{tag_path}"
+        else:
+            url = f"./{tag_path}"
+        chips.append(f'<a class="webpublish-tag-chip" href="{url}">#{escape(tag)}</a>')
+    return f'<div class="webpublish-tags">{"".join(chips)}</div>'
+
+
+def render_post_preview_html(post: dict, alias: str, comment_count: int, base_url: str = "") -> str:
     eid = safe_element_id(post["event_id"])
     title_line = (post.get("body") or "").split("\n", 1)[0][:120]
     author = escape(post.get("sender_name") or post["sender"])
@@ -274,7 +307,13 @@ def render_post_preview_html(post: dict, alias: str, comment_count: int) -> str:
         comments_text = f"{comment_count} comment{'s' if comment_count != 1 else ''}"
     else:
         comments_text = "no comments"
-    post_url = f"./post/{quote(post['event_id'], safe='')}" if not alias else f"./{alias}/post/{quote(post['event_id'], safe='')}"
+    eid_enc = quote(post["event_id"], safe="")
+    if base_url:
+        post_url = f"{base_url}/{alias}/post/{eid_enc}" if alias else f"{base_url}/post/{eid_enc}"
+    else:
+        post_url = f"./post/{eid_enc}" if not alias else f"./{alias}/post/{eid_enc}"
+    tags_html = render_tag_chips(post.get("tags", []), alias, base_url)
+    tags_section = f'\n  {tags_html}' if tags_html else ""
 
     return (
         f'<article class="webpublish-post-preview" id="{eid}">\n'
@@ -285,6 +324,7 @@ def render_post_preview_html(post: dict, alias: str, comment_count: int) -> str:
         f'    <span>{date}</span>\n'
         f'    <span>{comments_text}</span>\n'
         f'  </div>\n'
+        f'{tags_section}\n'
         f'</article>'
     )
 
@@ -484,6 +524,19 @@ a:hover { text-decoration: underline; }
 }
 .webpublish-post-excerpt { color: var(--text-muted); }
 
+/* tags */
+.webpublish-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.webpublish-tag-chip {
+  display: inline-block; padding: 2px 10px; border-radius: 12px;
+  background: var(--bg-secondary); border: 1px solid var(--border);
+  font-size: 0.8rem; color: var(--text-muted); text-decoration: none;
+}
+.webpublish-post-preview .webpublish-tag-chip { background: var(--bg); }
+.webpublish-tag-chip:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
+.webpublish-tag-list { list-style: none; display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+.webpublish-tag-header { font-size: 1.3rem; font-weight: 600; margin: 16px 0 4px; }
+.webpublish-text-muted { color: var(--text-muted); }
+
 /* journal post detail */
 .webpublish-post-full { max-width: 800px; margin: 0 auto; padding: 24px; }
 .webpublish-post-full .webpublish-post-body {
@@ -501,6 +554,11 @@ a:hover { text-decoration: underline; }
 .webpublish-post-full .webpublish-post-body blockquote {
   border-left: 3px solid var(--border); padding-left: 16px; color: var(--text-muted);
 }
+/* full-width image figures in journal post detail */
+.webpublish-figure-full { display: block; margin: 0 0 4px; }
+.webpublish-figure-full img.webpublish-media { max-width: 100%; max-height: none; border-radius: 8px; }
+.webpublish-image-body { margin-top: 12px; line-height: 1.7; }
+
 .webpublish-comments { margin-top: 32px; border-top: 1px solid var(--border); padding-top: 24px; }
 .webpublish-comments h2 { font-size: 1.1rem; margin-bottom: 16px; }
 .webpublish-comment {
@@ -522,6 +580,43 @@ a:hover { text-decoration: underline; }
 .webpublish-back-link { display: inline-block; margin-bottom: 16px; }
 .webpublish-map { position: relative; border-radius: 8px; overflow: hidden; }
 """
+
+
+# ---------------------------------------------------------------------------
+# Open Graph helpers
+# ---------------------------------------------------------------------------
+
+def _og_meta_site(room_name: str, room_topic: str, encoded_alias: str, base_url: str) -> str:
+    url = f"{base_url}/" if not encoded_alias else f"{base_url}/{encoded_alias}"
+    desc = escape((room_topic or room_name)[:200])
+    return (
+        f'<meta property="og:type" content="website">\n'
+        f'<meta property="og:title" content="{escape(room_name)}">\n'
+        f'<meta property="og:description" content="{desc}">\n'
+        f'<meta property="og:url" content="{escape(url)}">'
+    )
+
+
+def _og_meta_post(post: dict, room_name: str, encoded_alias: str, base_url: str, homeserver_url: str) -> str:
+    title = escape((post.get("body") or "").split("\n", 1)[0][:80] or "Untitled")
+    desc = escape((post.get("body") or "")[:200].replace("\n", " "))
+    eid_enc = quote(post["event_id"], safe="")
+    url = f"{base_url}/post/{eid_enc}" if not encoded_alias else f"{base_url}/{encoded_alias}/post/{eid_enc}"
+    iso = format_iso(post["timestamp"])
+    author = escape(post.get("sender_name") or post.get("sender", ""))
+    lines = [
+        f'<meta property="og:type" content="article">',
+        f'<meta property="og:title" content="{title}">',
+        f'<meta property="og:description" content="{desc}">',
+        f'<meta property="og:url" content="{escape(url)}">',
+        f'<meta property="article:published_time" content="{iso}">',
+        f'<meta property="article:author" content="{author}">',
+    ]
+    if post.get("msgtype") == "m.image" and post.get("media_url"):
+        img_url = mxc_to_http(post["media_url"], homeserver_url, base_url)
+        if img_url:
+            lines.append(f'<meta property="og:image" content="{escape(img_url)}">')
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -555,11 +650,7 @@ _LEAFLET_INIT_SCRIPT = (
 )
 
 
-def _page_head(title: str, custom_css: str, extra_head: str = "") -> str:
-    # User CSS goes in a second <style> block that follows BASE_CSS. This ensures
-    # @import-ed themes and :root variable overrides win via cascade order
-    # (later blocks beat earlier blocks at the same specificity). Within the user
-    # block, @import lines are hoisted to the top as the CSS spec requires.
+def _page_head(title: str, custom_css: str, extra_head: str = "", og_meta: str = "") -> str:
     import_lines, override_lines = [], []
     for line in (custom_css or "").splitlines():
         (import_lines if line.strip().startswith("@import") else override_lines).append(line)
@@ -568,11 +659,13 @@ def _page_head(title: str, custom_css: str, extra_head: str = "") -> str:
     user_css = f"{css_imports}\n{css_overrides}".strip()
     user_style = f"<style>\n{user_css}\n</style>\n" if user_css else ""
     leaflet = f"{extra_head}\n" if extra_head else ""
+    og = f"{og_meta}\n" if og_meta else ""
     return (
         f'<!DOCTYPE html>\n<html lang="en">\n<head>\n'
         f'<meta charset="utf-8">\n'
         f'<meta name="viewport" content="width=device-width, initial-scale=1">\n'
         f'<title>{escape(title)}</title>\n'
+        f'{og}'
         f'<style>\n{BASE_CSS}\n</style>\n'
         f'{user_style}'
         f'{leaflet}'
@@ -772,14 +865,16 @@ def render_journal_landing(
     total_pages: int,
     custom_css: str,
     comment_counts: dict[str, int],
+    base_url: str = "",
 ) -> str:
-    head = _page_head(room_name, custom_css)
+    og = _og_meta_site(room_name, room_topic, encoded_alias, base_url) if base_url else ""
+    head = _page_head(room_name, custom_css, og_meta=og)
     topic_p = f"  <p>{escape(room_topic)}</p>" if room_topic else ""
 
     posts_parts = []
     for post in posts:
         count = comment_counts.get(post["event_id"], 0)
-        posts_parts.append(render_post_preview_html(post, encoded_alias, count))
+        posts_parts.append(render_post_preview_html(post, encoded_alias, count, base_url))
     posts_html = "\n".join(posts_parts)
 
     pag_parts: list[str] = []
@@ -819,11 +914,16 @@ def render_journal_post(
 ) -> str:
     title = (post.get("body") or "").split("\n", 1)[0][:80]
     has_maps = _needs_leaflet([post] + comments)
-    head = _page_head(f"{title} - {room_name}", custom_css, extra_head=_LEAFLET_HEAD_ASSETS if has_maps else "")
-    body_html = render_body(post, homeserver_url, proxy_base_url)
+    og = _og_meta_post(post, room_name, encoded_alias, proxy_base_url, homeserver_url) if proxy_base_url else ""
+    head = _page_head(f"{title} - {room_name}", custom_css, extra_head=_LEAFLET_HEAD_ASSETS if has_maps else "", og_meta=og)
+    body_html = render_body(post, homeserver_url, proxy_base_url, journal=True)
     author = escape(post.get("sender_name") or post["sender"])
     date = format_date(post["timestamp"])
     edited = " (edited)" if post.get("edited") else ""
+
+    tags = post.get("tags", [])
+    tags_html = render_tag_chips(tags, encoded_alias, proxy_base_url)
+    tags_section = f'\n    {tags_html}' if tags_html else ""
 
     comments_parts = [
         render_message_html(
@@ -853,6 +953,7 @@ def render_journal_post(
         f'      <span>{author}</span>\n'
         f'      <span>{date}{edited}</span>\n'
         f'    </div>\n'
+        f'{tags_section}\n'
         f'    <div class="webpublish-post-body">{body_html}</div>\n'
         f'  </article>\n'
         f'  <div class="webpublish-matrix-reply-link">\n'
@@ -863,4 +964,143 @@ def render_journal_post(
         f'    <div id="comments">\n{comments_html}\n    </div>\n'
         f'  </section>\n'
         f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n{scroll_script}\n</body>\n</html>'
+    )
+
+
+def render_atom_feed(
+    room_name: str,
+    room_topic: str,
+    posts: list[dict],
+    encoded_alias: str,
+    base_url: str,
+    homeserver_url: str,
+) -> str:
+    feed_url = f"{base_url}/" if not encoded_alias else f"{base_url}/{encoded_alias}"
+    self_url = f"{base_url}/feed.xml" if not encoded_alias else f"{base_url}/{encoded_alias}/feed.xml"
+    updated = format_iso(posts[0]["timestamp"]) if posts else format_iso(0)
+
+    entries = []
+    for post in posts:
+        title = escape((post.get("body") or "").split("\n", 1)[0][:80] or "Untitled")
+        eid_enc = quote(post["event_id"], safe="")
+        post_url = f"{base_url}/post/{eid_enc}" if not encoded_alias else f"{base_url}/{encoded_alias}/post/{eid_enc}"
+        iso = format_iso(post["timestamp"])
+        author = escape(post.get("sender_name") or post.get("sender", ""))
+        body_html = render_body(post, homeserver_url, base_url, journal=True)
+        content = escape(body_html)
+
+        enclosure = ""
+        if post.get("msgtype") == "m.image" and post.get("media_url"):
+            enc_url = mxc_to_http(post["media_url"], homeserver_url, base_url)
+            if enc_url:
+                enclosure = f'\n    <link rel="enclosure" href="{escape(enc_url)}"/>'
+
+        entries.append(
+            f'  <entry>\n'
+            f'    <id>{escape(post["event_id"])}</id>\n'
+            f'    <title>{title}</title>\n'
+            f'    <link href="{escape(post_url)}"/>{enclosure}\n'
+            f'    <published>{iso}</published>\n'
+            f'    <updated>{iso}</updated>\n'
+            f'    <author><name>{author}</name></author>\n'
+            f'    <content type="html">{content}</content>\n'
+            f'  </entry>'
+        )
+
+    entries_xml = "\n".join(entries)
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<feed xmlns="http://www.w3.org/2005/Atom">\n'
+        f'  <title>{escape(room_name)}</title>\n'
+        f'  <subtitle>{escape(room_topic or "")}</subtitle>\n'
+        f'  <link href="{escape(feed_url)}"/>\n'
+        f'  <link rel="self" href="{escape(self_url)}"/>\n'
+        f'  <updated>{updated}</updated>\n'
+        f'  <id>{escape(feed_url)}</id>\n'
+        f'{entries_xml}\n'
+        '</feed>'
+    )
+
+
+def render_tag_index_page(
+    room_name: str,
+    tags_with_counts: list[tuple[str, int]],
+    encoded_alias: str,
+    custom_css: str,
+    base_url: str = "",
+) -> str:
+    og = _og_meta_site(room_name, "", encoded_alias, base_url) if base_url else ""
+    head = _page_head(f"Tags - {room_name}", custom_css, og_meta=og)
+    back_href = "./" if not encoded_alias else f"../{encoded_alias}"
+
+    tag_items = []
+    for tag, count in tags_with_counts:
+        url = f"./{encoded_alias}/tag/{quote(tag, safe='')}" if encoded_alias else f"./tag/{quote(tag, safe='')}"
+        tag_items.append(
+            f'<li><a class="webpublish-tag-chip" href="{url}">#{escape(tag)}</a>'
+            f' <span class="webpublish-text-muted">({count})</span></li>'
+        )
+    tags_html = "\n    ".join(tag_items) if tag_items else "<li>No tags yet.</li>"
+
+    scroll_script = _scroll_header_script()
+    return (
+        f'{head}\n<body>\n'
+        f'<header class="webpublish-header">\n'
+        f'  <h1>{escape(room_name)}</h1>\n'
+        f'</header>\n'
+        f'<main class="webpublish-journal">\n'
+        f'  <a class="webpublish-back-link" href="{back_href}">&larr; back to posts</a>\n'
+        f'  <h2 class="webpublish-tag-header">All Tags</h2>\n'
+        f'  <ul class="webpublish-tag-list">\n    {tags_html}\n  </ul>\n'
+        f'</main>\n{scroll_script}\n</body>\n</html>'
+    )
+
+
+def render_tag_filter_page(
+    room_name: str,
+    tag: str,
+    posts: list[dict],
+    encoded_alias: str,
+    page: int,
+    total_pages: int,
+    custom_css: str,
+    comment_counts: dict[str, int],
+    base_url: str = "",
+) -> str:
+    og = _og_meta_site(f"#{tag} - {room_name}", "", encoded_alias, base_url) if base_url else ""
+    head = _page_head(f"#{tag} - {room_name}", custom_css, og_meta=og)
+    back_href = "../" if not encoded_alias else f"../../{encoded_alias}"
+
+    posts_parts = []
+    for post in posts:
+        count = comment_counts.get(post["event_id"], 0)
+        posts_parts.append(render_post_preview_html(post, encoded_alias, count, base_url))
+    posts_html = "\n".join(posts_parts) if posts_parts else "<p>No posts with this tag.</p>"
+
+    pag_parts: list[str] = []
+    if total_pages > 1:
+        tag_enc = quote(tag, safe="")
+        for p in range(1, total_pages + 1):
+            if p == page:
+                pag_parts.append(f'<span class="active">{p}</span>')
+            else:
+                url_part = f"./{encoded_alias}/tag/{tag_enc}" if encoded_alias else f"./tag/{tag_enc}"
+                pag_parts.append(f'<a href="{url_part}?page={p}">{p}</a>')
+    pag_html = (
+        f'<nav class="webpublish-pagination">{"".join(pag_parts)}</nav>'
+        if pag_parts else ""
+    )
+
+    scroll_script = _scroll_header_script()
+    return (
+        f'{head}\n<body>\n'
+        f'<header class="webpublish-header">\n'
+        f'  <h1>{escape(room_name)}</h1>\n'
+        f'</header>\n'
+        f'<main class="webpublish-journal">\n'
+        f'  <a class="webpublish-back-link" href="{back_href}">&larr; back to posts</a>\n'
+        f'  <h2 class="webpublish-tag-header">#{escape(tag)}</h2>\n'
+        f'  <div class="webpublish-posts">\n{posts_html}\n  </div>\n'
+        f'  {pag_html}\n'
+        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{scroll_script}\n</body>\n</html>'
     )

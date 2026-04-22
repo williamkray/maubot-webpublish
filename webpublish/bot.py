@@ -16,12 +16,16 @@ from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
 from .db import upgrade_table
 from .templates import (
+    parse_hashtags,
+    render_atom_feed,
     render_body,
     render_chat_page,
     render_journal_landing,
     render_journal_post,
     render_message_html,
     render_post_preview_html,
+    render_tag_filter_page,
+    render_tag_index_page,
     safe_element_id,
 )
 
@@ -210,6 +214,64 @@ class WebPublishBot(Plugin):
         await self.database.execute(
             "UPDATE messages SET published=TRUE WHERE event_id=$1", event_id
         )
+
+    async def _store_tags(self, event_id: str, room_id: str, body: str) -> None:
+        tags = parse_hashtags(body)
+        await self.database.execute("DELETE FROM post_tags WHERE event_id=$1", event_id)
+        for tag in tags:
+            await self.database.execute(
+                "INSERT INTO post_tags (event_id, room_id, tag) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+                event_id, room_id, tag,
+            )
+
+    async def _get_tag_counts(self, room_id: str) -> list[tuple[str, int]]:
+        rows = await self.database.fetch(
+            "SELECT pt.tag, COUNT(*) AS cnt FROM post_tags pt "
+            "JOIN messages m ON m.event_id = pt.event_id "
+            "WHERE pt.room_id=$1 AND m.published=TRUE AND m.redacted=FALSE "
+            "GROUP BY pt.tag ORDER BY cnt DESC, pt.tag ASC",
+            room_id,
+        )
+        return [(r["tag"], r["cnt"]) for r in rows]
+
+    async def _get_posts_by_tag(
+        self, room_id: str, tag: str, page: int, per_page: int,
+    ) -> tuple[list[dict], int]:
+        total = await self.database.fetchval(
+            "SELECT COUNT(*) FROM post_tags pt "
+            "JOIN messages m ON m.event_id = pt.event_id "
+            "WHERE pt.room_id=$1 AND pt.tag=$2 AND m.published=TRUE AND m.redacted=FALSE AND m.thread_root IS NULL",
+            room_id, tag,
+        ) or 0
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        offset = (page - 1) * per_page
+        rows = await self.database.fetch(
+            "SELECT m.* FROM messages m "
+            "JOIN post_tags pt ON pt.event_id = m.event_id "
+            "WHERE pt.room_id=$1 AND pt.tag=$2 AND m.published=TRUE AND m.redacted=FALSE AND m.thread_root IS NULL "
+            "ORDER BY m.timestamp DESC LIMIT $3 OFFSET $4",
+            room_id, tag, per_page, offset,
+        )
+        return [dict(r) for r in rows], total_pages
+
+    async def _get_tags_for_posts(self, event_ids: list[str]) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {eid: [] for eid in event_ids}
+        if not event_ids:
+            return result
+        placeholders = ",".join(f"${i + 1}" for i in range(len(event_ids)))
+        rows = await self.database.fetch(
+            f"SELECT event_id, tag FROM post_tags WHERE event_id IN ({placeholders}) ORDER BY tag",
+            *event_ids,
+        )
+        for row in rows:
+            result[row["event_id"]].append(row["tag"])
+        return result
+
+    async def _get_tags_for_post(self, event_id: str) -> list[str]:
+        rows = await self.database.fetch(
+            "SELECT tag FROM post_tags WHERE event_id=$1 ORDER BY tag", event_id
+        )
+        return [r["tag"] for r in rows]
 
     async def _get_thread_comments(self, thread_root: str) -> list[dict]:
         rows = await self.database.fetch(
@@ -632,6 +694,8 @@ class WebPublishBot(Plugin):
                         avatar_url=sender_avatar,
                         published=backfill_published,
                     )
+                    if info.get("mode") == "journal" and thread_root is None:
+                        await self._store_tags(raw["event_id"], room_id, body)
                     total += 1
 
                 end_token = content.get("end")
@@ -655,6 +719,12 @@ class WebPublishBot(Plugin):
             if pending_edits:
                 for target_event_id, (new_body, new_formatted_body) in pending_edits.items():
                     await self._update_message_edit(target_event_id, new_body, new_formatted_body)
+                    if info.get("mode") == "journal":
+                        thread_root_val = await self.database.fetchval(
+                            "SELECT thread_root FROM messages WHERE event_id=$1", target_event_id
+                        )
+                        if thread_root_val is None and new_body:
+                            await self._store_tags(target_event_id, room_id, new_body)
 
             self.log.info(f"Backfill complete for {room_id}: {total} messages stored")
         except Exception as e:
@@ -688,6 +758,13 @@ class WebPublishBot(Plugin):
             new_body = content.body or body
             new_fmt = getattr(content, "formatted_body", None)
             await self._update_message_edit(target_id, new_body, new_fmt)
+            info = self._published[evt.room_id]
+            if info["mode"] == "journal":
+                thread_root_val = await self.database.fetchval(
+                    "SELECT thread_root FROM messages WHERE event_id=$1", target_id
+                )
+                if thread_root_val is None and new_body:
+                    await self._store_tags(target_id, evt.room_id, new_body)
 
             body_html = render_body(
                 {"body": new_body, "formatted_body": new_fmt, "redacted": False,
@@ -778,6 +855,8 @@ class WebPublishBot(Plugin):
             published=published,
             avatar_url=sender_avatar,
         )
+        if info["mode"] == "journal" and thread_root is None:
+            await self._store_tags(str(evt.event_id), evt.room_id, body)
 
         # SSE notification
         hs = self._homeserver_url()
@@ -814,6 +893,7 @@ class WebPublishBot(Plugin):
                     "event_id": str(evt.event_id),
                 })
             elif published:
+                msg_dict["tags"] = parse_hashtags(body)
                 html = render_post_preview_html(msg_dict, info["alias"], 0)
                 self._notify_sse(evt.room_id, "new_message", {
                     "html": html, "is_thread": False,
@@ -973,6 +1053,83 @@ class WebPublishBot(Plugin):
         return Response(text=css, content_type="text/css",
                         headers={"Cache-Control": "public, max-age=86400"})
 
+    @web.get("/{alias}/feed.xml")
+    async def web_feed_xml(self, req: Request) -> Response:
+        return await self._handle_feed(req, unquote(req.match_info["alias"]))
+
+    @web.get("/feed.xml")
+    async def web_feed_xml_root(self, req: Request) -> Response:
+        return await self._handle_feed(req, "/")
+
+    async def _handle_feed(self, req: Request, alias: str) -> Response:
+        room_id = self._alias_to_room.get(alias)
+        if not room_id:
+            return Response(status=404, text="Room not found")
+        info = self._published.get(room_id, {})
+        if info.get("mode") != "journal":
+            return Response(status=404, text="Not a journal room")
+        posts, _ = await self._get_posts(room_id, page=1, per_page=20)
+        room_name = await self._get_room_name(room_id) or alias
+        room_topic = await self._get_room_topic(room_id)
+        encoded = "" if alias == "/" else alias
+        xml = render_atom_feed(room_name, room_topic, posts, encoded, self._base_url, self._homeserver_url())
+        return Response(text=xml, content_type="application/atom+xml",
+                        headers={"Cache-Control": "public, max-age=300"})
+
+    @web.get("/{alias}/tags")
+    async def web_tag_index(self, req: Request) -> Response:
+        return await self._handle_tag_index(req, unquote(req.match_info["alias"]))
+
+    @web.get("/tags")
+    async def web_all_tags_root(self, req: Request) -> Response:
+        return await self._handle_tag_index(req, "/")
+
+    async def _handle_tag_index(self, req: Request, alias: str) -> Response:
+        room_id = self._alias_to_room.get(alias)
+        if not room_id:
+            return Response(status=404, text="Room not found")
+        info = self._published.get(room_id, {})
+        if info.get("mode") != "journal":
+            return Response(status=404, text="Not a journal room")
+        room_name = await self._get_room_name(room_id) or alias
+        tags = await self._get_tag_counts(room_id)
+        encoded = "" if alias == "/" else alias
+        html = render_tag_index_page(room_name, tags, encoded, self.config["css"], self._base_url)
+        return Response(text=html, content_type="text/html")
+
+    @web.get("/{alias}/tag/{name}")
+    async def web_tag_filter(self, req: Request) -> Response:
+        return await self._handle_tag_filter(
+            req, unquote(req.match_info["alias"]), unquote(req.match_info["name"])
+        )
+
+    @web.get("/tag/{name}")
+    async def web_tag_filter_root(self, req: Request) -> Response:
+        return await self._handle_tag_filter(req, "/", unquote(req.match_info["name"]))
+
+    async def _handle_tag_filter(self, req: Request, alias: str, tag: str) -> Response:
+        room_id = self._alias_to_room.get(alias)
+        if not room_id:
+            return Response(status=404, text="Room not found")
+        info = self._published.get(room_id, {})
+        if info.get("mode") != "journal":
+            return Response(status=404, text="Not a journal room")
+        page = int(req.query.get("page", "1"))
+        per_page = self.config["pagination"]
+        posts, total_pages = await self._get_posts_by_tag(room_id, tag.lower(), page, per_page)
+        eids = [p["event_id"] for p in posts]
+        counts = await self._get_comment_counts(eids)
+        post_tags = await self._get_tags_for_posts(eids)
+        for post in posts:
+            post["tags"] = post_tags.get(post["event_id"], [])
+        room_name = await self._get_room_name(room_id) or alias
+        encoded = "" if alias == "/" else alias
+        html = render_tag_filter_page(
+            room_name, tag.lower(), posts, encoded, page, total_pages,
+            self.config["css"], counts, self._base_url,
+        )
+        return Response(text=html, content_type="text/html")
+
     @web.get("/{alias}")
     async def web_main(self, req: Request) -> Response:
         return await self._handle_main(req, unquote(req.match_info["alias"]))
@@ -1009,9 +1166,13 @@ class WebPublishBot(Plugin):
             posts, total_pages = await self._get_posts(room_id, page, per_page)
             eids = [p["event_id"] for p in posts]
             counts = await self._get_comment_counts(eids)
+            post_tags = await self._get_tags_for_posts(eids)
+            for post in posts:
+                post["tags"] = post_tags.get(post["event_id"], [])
             html = render_journal_landing(
                 room_name, room_topic, posts, encoded,
                 page, total_pages, css, counts,
+                base_url=self._base_url,
             )
 
         return Response(text=html, content_type="text/html")
@@ -1048,6 +1209,7 @@ class WebPublishBot(Plugin):
         hs = self._homeserver_url()
         css = self.config["css"]
         encoded = "" if alias == "/" else alias
+        post["tags"] = await self._get_tags_for_post(event_id)
 
         html = render_journal_post(
             room_name, post, comments, encoded, css, hs, self._base_url,
