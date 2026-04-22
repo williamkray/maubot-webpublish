@@ -60,6 +60,7 @@ class WebPublishBot(Plugin):
         self._sse_queues: dict[str, set[asyncio.Queue]] = {}
         self._display_names: dict[str, str] = {}
         self._avatar_urls: dict[str, str] = {}
+        self._room_avatars: dict[str, str] = {}
         self._backfilling: set[str] = set()
         self._media_cache: OrderedDict[str, tuple[str, bytes]] = OrderedDict()
         self._media_cache_max: int = 100
@@ -330,6 +331,21 @@ class WebPublishBot(Plugin):
             return ev.topic or ""
         except Exception:
             return ""
+
+    async def _get_room_avatar(self, room_id: str) -> str:
+        if room_id in self._room_avatars:
+            return self._room_avatars[room_id]
+        try:
+            content = await self.client.api.request(
+                Method.GET,
+                Path.v3.rooms[room_id].state["m.room.avatar"],
+            )
+            url = content.get("url", "") if isinstance(content, dict) else ""
+        except Exception as e:
+            self.log.debug(f"Could not fetch room avatar for {room_id}: {e}")
+            url = ""
+        self._room_avatars[room_id] = url
+        return url
 
     async def _get_room_create_info(self, room_id: str) -> tuple[int, set[str]]:
         """Return (room_version, set_of_creator_mxids) for the room, cached."""
@@ -1092,9 +1108,10 @@ class WebPublishBot(Plugin):
         if info.get("mode") != "journal":
             return Response(status=404, text="Not a journal room")
         room_name = await self._get_room_name(room_id) or alias
+        room_avatar_url = await self._get_room_avatar(room_id)
         tags = await self._get_tag_counts(room_id)
         encoded = "" if alias == "/" else alias
-        html = render_tag_index_page(room_name, tags, encoded, self.config["css"], self._base_url)
+        html = render_tag_index_page(room_name, tags, encoded, self.config["css"], self._base_url, room_avatar_url=room_avatar_url)
         return Response(text=html, content_type="text/html")
 
     @web.get("/{alias}/tag/{name}")
@@ -1123,10 +1140,12 @@ class WebPublishBot(Plugin):
         for post in posts:
             post["tags"] = post_tags.get(post["event_id"], [])
         room_name = await self._get_room_name(room_id) or alias
+        room_avatar_url = await self._get_room_avatar(room_id)
         encoded = "" if alias == "/" else alias
         html = render_tag_filter_page(
             room_name, tag.lower(), posts, encoded, page, total_pages,
             self.config["css"], counts, self._base_url,
+            room_avatar_url=room_avatar_url,
         )
         return Response(text=html, content_type="text/html")
 
@@ -1150,6 +1169,7 @@ class WebPublishBot(Plugin):
         info = self._published[room_id]
         room_name = await self._get_room_name(room_id) or (alias if alias != "/" else "")
         room_topic = await self._get_room_topic(room_id)
+        room_avatar_url = await self._get_room_avatar(room_id)
         hs = self._homeserver_url()
         css = self.config["css"]
         encoded = "" if alias == "/" else alias
@@ -1159,6 +1179,7 @@ class WebPublishBot(Plugin):
             await self._enrich_reply_context(messages)
             html = render_chat_page(
                 room_name, room_topic, messages, encoded, css, hs, self._base_url,
+                room_avatar_url=room_avatar_url,
             )
         else:
             page = int(req.query.get("page", "1"))
@@ -1173,6 +1194,7 @@ class WebPublishBot(Plugin):
                 room_name, room_topic, posts, encoded,
                 page, total_pages, css, counts,
                 base_url=self._base_url,
+                room_avatar_url=room_avatar_url,
             )
 
         return Response(text=html, content_type="text/html")
@@ -1206,6 +1228,7 @@ class WebPublishBot(Plugin):
         comments = await self._get_thread_comments(event_id)
         await self._enrich_reply_context(comments)
         room_name = await self._get_room_name(room_id) or (alias if alias != "/" else "")
+        room_avatar_url = await self._get_room_avatar(room_id)
         hs = self._homeserver_url()
         css = self.config["css"]
         encoded = "" if alias == "/" else alias
@@ -1213,6 +1236,7 @@ class WebPublishBot(Plugin):
 
         html = render_journal_post(
             room_name, post, comments, encoded, css, hs, self._base_url,
+            room_avatar_url=room_avatar_url,
         )
         return Response(text=html, content_type="text/html")
 

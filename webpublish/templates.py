@@ -447,7 +447,9 @@ a:hover { text-decoration: underline; }
   padding: 24px 32px; border-bottom: 1px solid var(--border); background: var(--bg-secondary);
   transition: padding 0.25s ease;
 }
+.webpublish-header-title { display: flex; align-items: center; gap: 0.5em; }
 .webpublish-header h1 { font-size: 1.5rem; font-weight: 600; }
+.webpublish-room-avatar { height: 2em; width: 2em; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
 .webpublish-header p  {
   color: var(--text-muted); margin-top: 4px;
   max-height: 6rem; overflow: hidden;
@@ -591,18 +593,23 @@ a:hover { text-decoration: underline; }
 # Open Graph helpers
 # ---------------------------------------------------------------------------
 
-def _og_meta_site(room_name: str, room_topic: str, encoded_alias: str, base_url: str) -> str:
+def _og_meta_site(room_name: str, room_topic: str, encoded_alias: str, base_url: str, room_avatar_url: str = "", proxy_base_url: str = "") -> str:
     url = f"{base_url}/" if not encoded_alias else f"{base_url}/{encoded_alias}"
     desc = escape((room_topic or room_name)[:200])
-    return (
-        f'<meta property="og:type" content="website">\n'
-        f'<meta property="og:title" content="{escape(room_name)}">\n'
-        f'<meta property="og:description" content="{desc}">\n'
-        f'<meta property="og:url" content="{escape(url)}">'
-    )
+    lines = [
+        f'<meta property="og:type" content="website">',
+        f'<meta property="og:title" content="{escape(room_name)}">',
+        f'<meta property="og:description" content="{desc}">',
+        f'<meta property="og:url" content="{escape(url)}">',
+    ]
+    if room_avatar_url and proxy_base_url:
+        avatar_http = mxc_to_http(room_avatar_url, "", proxy_base_url)
+        if avatar_http:
+            lines.append(f'<meta property="og:image" content="{escape(avatar_http)}">')
+    return "\n".join(lines)
 
 
-def _og_meta_post(post: dict, room_name: str, encoded_alias: str, base_url: str, homeserver_url: str) -> str:
+def _og_meta_post(post: dict, room_name: str, encoded_alias: str, base_url: str, homeserver_url: str, room_avatar_url: str = "") -> str:
     title = escape((post.get("body") or "").split("\n", 1)[0][:80] or "Untitled")
     desc = escape((post.get("body") or "")[:200].replace("\n", " "))
     eid_enc = quote(post["event_id"], safe="")
@@ -621,6 +628,10 @@ def _og_meta_post(post: dict, room_name: str, encoded_alias: str, base_url: str,
         img_url = mxc_to_http(post["media_url"], homeserver_url, base_url)
         if img_url:
             lines.append(f'<meta property="og:image" content="{escape(img_url)}">')
+    elif room_avatar_url:
+        avatar_http = mxc_to_http(room_avatar_url, homeserver_url, base_url)
+        if avatar_http:
+            lines.append(f'<meta property="og:image" content="{escape(avatar_http)}">')
     return "\n".join(lines)
 
 
@@ -827,6 +838,13 @@ def _scroll_header_script() -> str:
     )
 
 
+def _render_room_avatar_img(room_avatar_url: str, proxy_base_url: str) -> str:
+    if not room_avatar_url or not proxy_base_url:
+        return ""
+    http_url = mxc_to_http(room_avatar_url, "", proxy_base_url)
+    return f'<img class="webpublish-room-avatar" src="{escape(http_url)}" alt="">' if http_url else ""
+
+
 # ---------------------------------------------------------------------------
 # Full page functions
 # ---------------------------------------------------------------------------
@@ -842,6 +860,7 @@ def render_chat_page(
     custom_css: str,
     homeserver_url: str,
     proxy_base_url: str = "",
+    room_avatar_url: str = "",
 ) -> str:
     has_maps = _needs_leaflet(messages)
     head = _page_head(room_name, custom_css, extra_head=_LEAFLET_HEAD_ASSETS if has_maps else "")
@@ -850,10 +869,11 @@ def render_chat_page(
     sse = _sse_chat_script(encoded_alias)
     leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
     scroll_script = _scroll_header_script()
+    avatar_img = _render_room_avatar_img(room_avatar_url, proxy_base_url)
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
-        f'  <h1>{escape(room_name)}</h1>\n{topic_p}\n'
+        f'  <div class="webpublish-header-title">{avatar_img}<h1>{escape(room_name)}</h1></div>\n{topic_p}\n'
         f'</header>\n'
         f'<main class="webpublish-chat">\n'
         f'  <div class="webpublish-messages" id="messages">\n{msgs_html}\n  </div>\n'
@@ -871,8 +891,9 @@ def render_journal_landing(
     custom_css: str,
     comment_counts: dict[str, int],
     base_url: str = "",
+    room_avatar_url: str = "",
 ) -> str:
-    og = _og_meta_site(room_name, room_topic, encoded_alias, base_url) if base_url else ""
+    og = _og_meta_site(room_name, room_topic, encoded_alias, base_url, room_avatar_url, base_url) if base_url else ""
     head = _page_head(room_name, custom_css, og_meta=og)
     topic_p = f"  <p>{escape(room_topic)}</p>" if room_topic else ""
 
@@ -902,10 +923,11 @@ def render_journal_landing(
 
     sse = _sse_journal_landing_script(encoded_alias)
     scroll_script = _scroll_header_script()
+    avatar_img = _render_room_avatar_img(room_avatar_url, base_url)
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
-        f'  <h1>{escape(room_name)}</h1>\n{topic_p}\n'
+        f'  <div class="webpublish-header-title">{avatar_img}<h1>{escape(room_name)}</h1></div>\n{topic_p}\n'
         f'</header>\n'
         f'<main class="webpublish-journal">\n'
         f'  <div class="webpublish-posts">\n{posts_html}\n  </div>\n'
@@ -923,10 +945,11 @@ def render_journal_post(
     custom_css: str,
     homeserver_url: str,
     proxy_base_url: str = "",
+    room_avatar_url: str = "",
 ) -> str:
     title = (post.get("body") or "").split("\n", 1)[0][:80]
     has_maps = _needs_leaflet([post] + comments)
-    og = _og_meta_post(post, room_name, encoded_alias, proxy_base_url, homeserver_url) if proxy_base_url else ""
+    og = _og_meta_post(post, room_name, encoded_alias, proxy_base_url, homeserver_url, room_avatar_url) if proxy_base_url else ""
     head = _page_head(f"{title} - {room_name}", custom_css, extra_head=_LEAFLET_HEAD_ASSETS if has_maps else "", og_meta=og)
     body_html = render_body(post, homeserver_url, proxy_base_url, journal=True)
     author = escape(post.get("sender_name") or post["sender"])
@@ -953,10 +976,11 @@ def render_journal_post(
     leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
     scroll_script = _scroll_header_script()
     back_href = "../" if not encoded_alias else f"../../{encoded_alias}"
+    avatar_img = _render_room_avatar_img(room_avatar_url, proxy_base_url)
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
-        f'  <h1>{escape(room_name)}</h1>\n'
+        f'  <div class="webpublish-header-title">{avatar_img}<h1>{escape(room_name)}</h1></div>\n'
         f'</header>\n'
         f'<main class="webpublish-post-full">\n'
         f'  <a class="webpublish-back-link" href="{back_href}">&larr; back to posts</a>\n'
@@ -1040,8 +1064,9 @@ def render_tag_index_page(
     encoded_alias: str,
     custom_css: str,
     base_url: str = "",
+    room_avatar_url: str = "",
 ) -> str:
-    og = _og_meta_site(room_name, "", encoded_alias, base_url) if base_url else ""
+    og = _og_meta_site(room_name, "", encoded_alias, base_url, room_avatar_url, base_url) if base_url else ""
     head = _page_head(f"Tags - {room_name}", custom_css, og_meta=og)
     back_href = "./" if not encoded_alias else f"../{encoded_alias}"
 
@@ -1055,10 +1080,11 @@ def render_tag_index_page(
     tags_html = "\n    ".join(tag_items) if tag_items else "<li>No tags yet.</li>"
 
     scroll_script = _scroll_header_script()
+    avatar_img = _render_room_avatar_img(room_avatar_url, base_url)
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
-        f'  <h1>{escape(room_name)}</h1>\n'
+        f'  <div class="webpublish-header-title">{avatar_img}<h1>{escape(room_name)}</h1></div>\n'
         f'</header>\n'
         f'<main class="webpublish-journal">\n'
         f'  <a class="webpublish-back-link" href="{back_href}">&larr; back to posts</a>\n'
@@ -1078,8 +1104,9 @@ def render_tag_filter_page(
     custom_css: str,
     comment_counts: dict[str, int],
     base_url: str = "",
+    room_avatar_url: str = "",
 ) -> str:
-    og = _og_meta_site(f"#{tag} - {room_name}", "", encoded_alias, base_url) if base_url else ""
+    og = _og_meta_site(f"#{tag} - {room_name}", "", encoded_alias, base_url, room_avatar_url, base_url) if base_url else ""
     head = _page_head(f"#{tag} - {room_name}", custom_css, og_meta=og)
     back_href = "../" if not encoded_alias else f"../../{encoded_alias}"
 
@@ -1110,10 +1137,11 @@ def render_tag_filter_page(
     ) if base_url else ""
 
     scroll_script = _scroll_header_script()
+    avatar_img = _render_room_avatar_img(room_avatar_url, base_url)
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
-        f'  <h1>{escape(room_name)}</h1>\n'
+        f'  <div class="webpublish-header-title">{avatar_img}<h1>{escape(room_name)}</h1></div>\n'
         f'</header>\n'
         f'<main class="webpublish-journal">\n'
         f'  <a class="webpublish-back-link" href="{back_href}">&larr; back to posts</a>\n'
