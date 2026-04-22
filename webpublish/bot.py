@@ -5,7 +5,7 @@ import json
 import re
 from collections import OrderedDict
 from typing import Type
-from urllib.parse import quote, unquote
+from urllib.parse import unquote
 
 from aiohttp.web import Request, Response, StreamResponse
 from maubot import Plugin, MessageEvent
@@ -50,8 +50,9 @@ class WebPublishBot(Plugin):
 
     async def start(self) -> None:
         self.config.load_and_update()
-        self._published: dict[str, dict] = {}       # room_id -> {mode, alias}
+        self._published: dict[str, dict] = {}       # room_id -> {mode, alias, default_alias}
         self._alias_to_room: dict[str, str] = {}    # alias (no #) -> room_id
+        self._redirect_aliases: dict[str, str] = {}  # default_alias -> override_alias
         self._sse_queues: dict[str, set[asyncio.Queue]] = {}
         self._display_names: dict[str, str] = {}
         self._avatar_urls: dict[str, str] = {}
@@ -78,29 +79,43 @@ class WebPublishBot(Plugin):
 
     async def _load_published_rooms(self) -> None:
         rows = await self.database.fetch(
-            "SELECT room_id, mode, alias FROM published_rooms"
+            "SELECT room_id, mode, alias, default_alias FROM published_rooms"
         )
         for row in rows:
             rid, alias = row["room_id"], row["alias"]
-            self._published[rid] = {"mode": row["mode"], "alias": alias}
+            default_alias = row["default_alias"] or alias
+            self._published[rid] = {"mode": row["mode"], "alias": alias, "default_alias": default_alias}
             self._alias_to_room[alias] = rid
+            if default_alias != alias:
+                self._alias_to_room[default_alias] = rid
+                self._redirect_aliases[default_alias] = alias
 
     async def _set_published(self, room_id: str, mode: str, alias: str) -> None:
         old = self._published.get(room_id)
-        if old and old["alias"] != alias:
+        default_alias = old["default_alias"] if old else alias
+        if old and old["alias"] != alias and old["alias"] != default_alias:
             self._alias_to_room.pop(old["alias"], None)
         await self.database.execute(
-            "INSERT INTO published_rooms (room_id, mode, alias) VALUES ($1, $2, $3) "
+            "INSERT INTO published_rooms (room_id, mode, alias, default_alias) VALUES ($1, $2, $3, $3) "
             "ON CONFLICT (room_id) DO UPDATE SET mode = $2, alias = $3",
             room_id, mode, alias,
         )
-        self._published[room_id] = {"mode": mode, "alias": alias}
+        self._published[room_id] = {"mode": mode, "alias": alias, "default_alias": default_alias}
         self._alias_to_room[alias] = room_id
+        if default_alias != alias:
+            self._alias_to_room[default_alias] = room_id
+            self._redirect_aliases[default_alias] = alias
+        else:
+            self._redirect_aliases.pop(default_alias, None)
 
     async def _remove_published(self, room_id: str) -> None:
         info = self._published.pop(room_id, None)
         if info:
             self._alias_to_room.pop(info["alias"], None)
+            default_alias = info.get("default_alias")
+            if default_alias and default_alias != info["alias"]:
+                self._alias_to_room.pop(default_alias, None)
+                self._redirect_aliases.pop(default_alias, None)
         await self.database.execute(
             "DELETE FROM published_rooms WHERE room_id = $1", room_id
         )
@@ -443,7 +458,7 @@ class WebPublishBot(Plugin):
             await evt.reply("This room is not published.")
             return
         alias = info["alias"]
-        url = f"{self._base_url}/" if alias == "/" else f"{self._base_url}/{quote(alias, safe='')}"
+        url = f"{self._base_url}/" if alias == "/" else f"{self._base_url}/{alias}"
         await evt.reply(f"Published ({info['mode']} mode): {url}")
 
     @webpublish.subcommand("seturi", help="Override the URI path for this room's published site")
@@ -468,7 +483,7 @@ class WebPublishBot(Plugin):
             await evt.reply("That URI is already in use by another room.")
             return
         await self._set_published(evt.room_id, info["mode"], alias)
-        url = f"{self._base_url}/" if alias == "/" else f"{self._base_url}/{quote(alias, safe='')}"
+        url = f"{self._base_url}/" if alias == "/" else f"{self._base_url}/{alias}"
         await evt.reply(f"URI updated! Site now available at {url}")
 
     async def _publish_room(self, evt: MessageEvent, mode: str) -> None:
@@ -504,7 +519,7 @@ class WebPublishBot(Plugin):
         alias_str = str(alias).lstrip("#")
         await self._set_published(room_id, mode, alias_str)
 
-        url = f"{self._base_url}/{quote(alias_str, safe='')}"
+        url = f"{self._base_url}/{alias_str}"
         await evt.reply(f"Room published in **{mode}** mode!\n\n{url}")
 
         # backfill in background
@@ -799,8 +814,7 @@ class WebPublishBot(Plugin):
                     "event_id": str(evt.event_id),
                 })
             elif published:
-                encoded = quote(info["alias"], safe="")
-                html = render_post_preview_html(msg_dict, encoded, 0)
+                html = render_post_preview_html(msg_dict, info["alias"], 0)
                 self._notify_sse(evt.room_id, "new_message", {
                     "html": html, "is_thread": False,
                     "event_id": str(evt.event_id),
@@ -855,12 +869,11 @@ class WebPublishBot(Plugin):
 
         await self._publish_post(target_id)
 
-        encoded = quote(info["alias"], safe="")
         comment_count = await self.database.fetchval(
             "SELECT COUNT(*) FROM messages WHERE thread_root=$1 AND redacted=FALSE",
             target_id,
         ) or 0
-        html = render_post_preview_html(post, encoded, comment_count)
+        html = render_post_preview_html(post, info["alias"], comment_count)
         self._notify_sse(evt.room_id, "new_message", {
             "html": html, "is_thread": False,
             "event_id": target_id,
@@ -972,13 +985,17 @@ class WebPublishBot(Plugin):
         room_id = self._alias_to_room.get(alias)
         if not room_id:
             return Response(status=404, text="Room not found")
+        target_alias = self._redirect_aliases.get(alias)
+        if target_alias:
+            location = f"{self._base_url}/" if target_alias == "/" else f"{self._base_url}/{target_alias}"
+            return Response(status=302, headers={"Location": location})
 
         info = self._published[room_id]
         room_name = await self._get_room_name(room_id) or (alias if alias != "/" else "")
         room_topic = await self._get_room_topic(room_id)
         hs = self._homeserver_url()
         css = self.config["css"]
-        encoded = "" if alias == "/" else quote(alias, safe="")
+        encoded = "" if alias == "/" else alias
 
         if info["mode"] == "chat":
             messages = await self._get_messages(room_id, limit=200)
@@ -1013,6 +1030,13 @@ class WebPublishBot(Plugin):
         room_id = self._alias_to_room.get(alias)
         if not room_id:
             return Response(status=404, text="Room not found")
+        target_alias = self._redirect_aliases.get(alias)
+        if target_alias:
+            if target_alias == "/":
+                location = f"{self._base_url}/post/{event_id}"
+            else:
+                location = f"{self._base_url}/{target_alias}/post/{event_id}"
+            return Response(status=302, headers={"Location": location})
 
         post = await self._get_post(event_id)
         if not post or post["room_id"] != room_id:
@@ -1023,7 +1047,7 @@ class WebPublishBot(Plugin):
         room_name = await self._get_room_name(room_id) or (alias if alias != "/" else "")
         hs = self._homeserver_url()
         css = self.config["css"]
-        encoded = "" if alias == "/" else quote(alias, safe="")
+        encoded = "" if alias == "/" else alias
 
         html = render_journal_post(
             room_name, post, comments, encoded, css, hs, self._base_url,
@@ -1042,6 +1066,10 @@ class WebPublishBot(Plugin):
         room_id = self._alias_to_room.get(alias)
         if not room_id:
             return Response(status=404, text="Room not found")
+        target_alias = self._redirect_aliases.get(alias)
+        if target_alias:
+            location = f"{self._base_url}/sse" if target_alias == "/" else f"{self._base_url}/{target_alias}/sse"
+            return Response(status=302, headers={"Location": location})
 
         resp = StreamResponse()
         resp.content_type = "text/event-stream"

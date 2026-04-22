@@ -56,3 +56,9 @@ async def upgrade_v4(conn: Connection) -> None:
 @upgrade_table.register(description="Add avatar_url for sender profile pictures")
 async def upgrade_v5(conn: Connection) -> None:
     await conn.execute("ALTER TABLE messages ADD COLUMN avatar_url TEXT")
+
+
+@upgrade_table.register(description="Add default_alias to track canonical room alias for redirects")
+async def upgrade_v6(conn: Connection) -> None:
+    await conn.execute("ALTER TABLE published_rooms ADD COLUMN default_alias TEXT")
+    await conn.execute("UPDATE published_rooms SET default_alias = alias")
