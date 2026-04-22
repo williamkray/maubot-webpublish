@@ -51,12 +51,17 @@ Set per-room via `!webpublish chat|journal`:
 
 | Attribute | Purpose |
 |---|---|
-| `_published` | `room_id → {mode, alias}` — avoids DB lookup on every request |
+| `_published` | `room_id → {mode, alias, default_alias}` — avoids DB lookup on every request |
 | `_alias_to_room` | `alias → room_id` — used by all web handlers |
+| `_redirect_aliases` | `default_alias → override_alias` — 302 redirect map |
 | `_display_names` | `sender_mxid → display_name` — avoids repeated API calls |
 | `_avatar_urls` | `sender_mxid → avatar mxc:// URL` — avoids repeated API calls |
+| `_room_avatars` | `room_id → room avatar mxc:// URL` — avoids repeated API calls |
 | `_sse_queues` | `room_id → set[Queue]` — live browser connections |
 | `_media_cache` | `"server/id" → (content_type, bytes)` — LRU media cache |
+| `_tile_cache` | `"z/x/y" → bytes` — OSM tile proxy LRU cache |
+| `_backfilling` | `set[room_id]` — guards against concurrent backfills |
+| `_room_create_cache` | `room_id → (version, set[creator_mxid])` — room v12 creator check |
 
 ### Key maubot/mautrix patterns
 
@@ -66,6 +71,22 @@ Set per-room via `!webpublish chat|journal`:
 - `self.client.api.request(Method.GET, Path.v3.rooms[rid].messages, ...)` makes authenticated Matrix API calls.
 - `self.database.fetch/fetchrow/fetchval/execute(sql, *args)` are the async DB methods.
 - `self.webapp_url` is the auto-detected public URL of this plugin instance.
+
+#### Fetching Matrix room state events
+
+`self.client.get_state_event(room_id, EventType.X)` only works reliably for event types already proven in the codebase (ROOM_NAME, ROOM_TOPIC, ROOM_MEMBER, ROOM_CANONICAL_ALIAS, ROOM_ENCRYPTION, ROOM_POWER_LEVELS, ROOM_CREATE). For any other type the EventType attribute may not exist or the deserialized content may not have the expected attributes — exceptions disappear silently.
+
+**For any new/unfamiliar state event type, use the raw API:**
+
+```python
+content = await self.client.api.request(
+    Method.GET,
+    Path.v3.rooms[room_id].state["m.room.event_type"],
+)
+value = content.get("field", "") if isinstance(content, dict) else ""
+```
+
+Always add `self.log.debug(f"...: {e}")` in the except clause so failures are visible rather than silently returning empty string.
 
 ### Config keys (`base-config.yaml`)
 
