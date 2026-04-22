@@ -274,7 +274,7 @@ def render_post_preview_html(post: dict, alias: str, comment_count: int) -> str:
         comments_text = f"{comment_count} comment{'s' if comment_count != 1 else ''}"
     else:
         comments_text = "no comments"
-    post_url = f"post/{quote(post['event_id'], safe='')}" if not alias else f"{alias}/post/{quote(post['event_id'], safe='')}"
+    post_url = f"./post/{quote(post['event_id'], safe='')}" if not alias else f"./{alias}/post/{quote(post['event_id'], safe='')}"
 
     return (
         f'<article class="webpublish-post-preview" id="{eid}">\n'
@@ -603,7 +603,7 @@ _LOCALIZE_TIMESTAMPS_SCRIPT = (
 
 
 def _sse_chat_script(encoded_alias: str) -> str:
-    sse_url = "sse" if not encoded_alias else f"{encoded_alias}/sse"
+    sse_url = "./sse" if not encoded_alias else f"./{encoded_alias}/sse"
     return (
         '<script>\n'
         '(function() {\n'
@@ -645,7 +645,7 @@ def _sse_chat_script(encoded_alias: str) -> str:
 
 
 def _sse_journal_landing_script(encoded_alias: str) -> str:
-    sse_url = "sse" if not encoded_alias else f"{encoded_alias}/sse"
+    sse_url = "./sse" if not encoded_alias else f"./{encoded_alias}/sse"
     return (
         '<script>\n'
         '(function() {\n'
@@ -788,7 +788,7 @@ def render_journal_landing(
             if p == page:
                 pag_parts.append(f'<span class="active">{p}</span>')
             else:
-                pag_parts.append(f'<a href="{encoded_alias}?page={p}">{p}</a>')
+                pag_parts.append(f'<a href="./{encoded_alias}?page={p}">{p}</a>')
     pag_html = (
         f'<nav class="webpublish-pagination">{"".join(pag_parts)}</nav>'
         if pag_parts else ""
