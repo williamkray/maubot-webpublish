@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timezone
 from html import escape
 from html.parser import HTMLParser
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +160,18 @@ def mxc_to_http(mxc_url: str, homeserver_url: str, proxy_base_url: str = "") -> 
         return f"{proxy_base_url.rstrip('/')}/media/{server_media}"
     hs = homeserver_url.rstrip("/")
     return f"{hs}/_matrix/media/v3/download/{server_media}"
+
+
+def matrix_event_uri(room_id: str, event_id: str, homeserver_url: str = "") -> str:
+    """Build a native matrix: URI for an event in a room (MSC2312)."""
+    rid = room_id.lstrip("!")
+    eid = event_id.lstrip("$")
+    uri = f"matrix:roomid/{quote(rid, safe=':')}/e/{quote(eid, safe=':')}"
+    if homeserver_url:
+        host = urlparse(homeserver_url).hostname
+        if host:
+            uri += f"?via={quote(host)}"
+    return uri
 
 
 # ---------------------------------------------------------------------------
@@ -1440,7 +1452,7 @@ def render_pinned_banner_html(
     homeserver_url: str,
 ) -> str:
     """Chat-mode banner listing pinned messages with anchor links to in-feed
-    elements. Messages whose bodies we don't have render as matrix.to links."""
+    elements. Messages whose bodies we don't have render as matrix: URI links."""
     if not pinned_msgs:
         return ""
     items: list[str] = []
@@ -1458,9 +1470,7 @@ def render_pinned_banner_html(
                 f' <span class="webpublish-pinned-sender">— {sender}</span></li>'
             )
         else:
-            mx_href = (
-                f"https://matrix.to/#/{quote(room_id)}/{quote(eid)}"
-            )
+            mx_href = matrix_event_uri(room_id, eid, homeserver_url)
             items.append(
                 f'<li><a href="{escape(mx_href)}" target="_blank" rel="noopener">'
                 f'View in Matrix</a>'
@@ -1731,7 +1741,7 @@ def render_journal_post(
     count = len(comments)
     label = f"{count} comment{'s' if count != 1 else ''}" if count else "No comments yet"
 
-    matrix_link = f"https://matrix.to/#/{quote(post['room_id'])}/{quote(post['event_id'])}"
+    matrix_link = matrix_event_uri(post["room_id"], post["event_id"], homeserver_url)
     sse = _sse_post_detail_script(post["event_id"])
     leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
     scroll_script = _scroll_header_script()
