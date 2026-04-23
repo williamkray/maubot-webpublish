@@ -49,6 +49,8 @@ Set per-room via `!webpublish chat|journal`:
 - `thread_reply_removed` *(chat mode only)* — a threaded reply was redacted. Same payload shape as `thread_reply` but with `removed_element_id` instead of `reply_*`; `indicator_html` is empty when `count == 0`.
 - `reaction_added` — a non-control reaction was added to a tracked message. Payload: `event_id`, `element_id`, `reactions_html` (full re-rendered `<div class="webpublish-reactions">…</div>` for the target; empty string = no reactions). The 📰 publish-signal in journal mode does not emit this event.
 - `reaction_removed` — a reaction was redacted. Same payload shape as `reaction_added`; `reactions_html` is empty when the last reaction is gone.
+- `post_unpublished` *(journal mode only)* — a top-level post transitioned to draft because the last privileged 📰 reaction was redacted. Payload: `element_id`, `event_id`. Landing page removes the card; post-detail page reloads (server 404s).
+- `pinned_changed` — the room's `m.room.pinned_events` state changed. Payload depends on mode: chat → `{"banner_html": <str>}` (full `<div class="webpublish-pinned-banner">…</div>` or empty string); journal → `{"html": <str>}` (full `<section class="webpublish-pinned-posts">…</section>` or empty string). Empty payload means remove the element from the DOM.
 
 ### Media proxy
 
@@ -71,6 +73,7 @@ Set per-room via `!webpublish chat|journal`:
 | `_tile_cache` | `"z/x/y" → bytes` — OSM tile proxy LRU cache |
 | `_backfilling` | `set[room_id]` — guards against concurrent backfills |
 | `_room_create_cache` | `room_id → (version, set[creator_mxid])` — room v12 creator check |
+| `_pinned_events` | `room_id → ordered list[event_id]` — latest `m.room.pinned_events` contents; populated on start/publish and refreshed by the state handler |
 
 ### Key maubot/mautrix patterns
 
@@ -84,6 +87,8 @@ Set per-room via `!webpublish chat|journal`:
 #### Fetching Matrix room state events
 
 `self.client.get_state_event(room_id, EventType.X)` only works reliably for event types already proven in the codebase (ROOM_NAME, ROOM_TOPIC, ROOM_MEMBER, ROOM_CANONICAL_ALIAS, ROOM_ENCRYPTION, ROOM_POWER_LEVELS, ROOM_CREATE). For any other type the EventType attribute may not exist or the deserialized content may not have the expected attributes — exceptions disappear silently.
+
+Raw-API state lookups already proven in the codebase: `m.room.avatar`, `m.room.pinned_events`, and the plugin's own `org.jobmachine.webpublish.config`.
 
 **For any new/unfamiliar state event type, use the raw API:**
 

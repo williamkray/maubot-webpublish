@@ -22,7 +22,7 @@ ALLOWED_TAGS = frozenset({
 
 ALLOWED_ATTRS: dict[str, set[str]] = {
     "a": {"href", "rel", "target"},
-    "img": {"src", "alt", "width", "height", "title"},
+    "img": {"src", "alt", "width", "height", "title", "data-mx-emoticon"},
     "span": {"data-mx-color", "data-mx-bg-color"},
     "code": {"class"},
     "td": {"colspan", "rowspan"},
@@ -33,10 +33,12 @@ ALLOWED_ATTRS: dict[str, set[str]] = {
 class _Sanitizer(HTMLParser):
     """Strip all HTML tags/attributes not in the allowlist."""
 
-    def __init__(self) -> None:
+    def __init__(self, homeserver_url: str = "", proxy_base_url: str = "") -> None:
         super().__init__()
         self.parts: list[str] = []
         self._skip = 0
+        self._homeserver_url = homeserver_url
+        self._proxy_base_url = proxy_base_url
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
@@ -49,6 +51,7 @@ class _Sanitizer(HTMLParser):
             return
         allowed = ALLOWED_ATTRS.get(tag, set())
         safe_attrs: list[str] = []
+        is_custom_emoji = False
         for name, value in attrs:
             name = name.lower()
             if name not in allowed:
@@ -58,7 +61,13 @@ class _Sanitizer(HTMLParser):
             val = value or ""
             if "javascript:" in val.lower() or "vbscript:" in val.lower():
                 continue
+            if tag == "img" and name == "src" and val.startswith("mxc://"):
+                val = mxc_to_http(val, self._homeserver_url, self._proxy_base_url)
+            if tag == "img" and name == "data-mx-emoticon":
+                is_custom_emoji = True
             safe_attrs.append(f' {escape(name)}="{escape(val)}"')
+        if tag == "img" and is_custom_emoji:
+            safe_attrs.append(' class="webpublish-custom-emoji"')
         self.parts.append(f"<{tag}{''.join(safe_attrs)}>")
 
     def handle_endtag(self, tag: str) -> None:
@@ -87,8 +96,8 @@ class _Sanitizer(HTMLParser):
         return "".join(self.parts)
 
 
-def sanitize_html(html_str: str) -> str:
-    s = _Sanitizer()
+def sanitize_html(html_str: str, homeserver_url: str = "", proxy_base_url: str = "") -> str:
+    s = _Sanitizer(homeserver_url=homeserver_url, proxy_base_url=proxy_base_url)
     s.feed(html_str)
     return s.get_output()
 
@@ -175,7 +184,7 @@ def render_body(msg: dict, homeserver_url: str, proxy_base_url: str = "", journa
                 # Journal posts: image displayed full-width, body rendered as prose below
                 formatted = msg.get("formatted_body")
                 if formatted:
-                    text_block = f'<div class="webpublish-image-body">{sanitize_html(formatted)}</div>'
+                    text_block = f'<div class="webpublish-image-body">{sanitize_html(formatted, homeserver_url, proxy_base_url)}</div>'
                 elif not is_filename:
                     text_block = f'<div class="webpublish-image-body">{escape(body_text).replace(chr(10), "<br>")}</div>'
                 else:
@@ -228,8 +237,53 @@ def render_body(msg: dict, homeserver_url: str, proxy_base_url: str = "", journa
     # m.text, m.notice, fallback
     formatted = msg.get("formatted_body")
     if formatted:
-        return sanitize_html(formatted)
+        return sanitize_html(formatted, homeserver_url, proxy_base_url)
     return escape(msg.get("body", "")).replace("\n", "<br>")
+
+
+# Unicode emoji ranges for "big emoji" detection. Intentionally broad but
+# cheap; we only use it to decide whether to enlarge the body, so false
+# positives merely enlarge; they don't mangle content.
+_EMOJI_ONLY_RE = re.compile(
+    "^(?:"
+    r"[\U0001F000-\U0001FFFF]"       # supplementary pictographs
+    r"|[\u2600-\u27BF]"              # misc symbols, dingbats
+    r"|[\uFE00-\uFE0F]"              # variation selectors
+    r"|[\u200D\u20E3]"               # ZWJ, keycap
+    r"|[\U000E0020-\U000E007F]"      # tag sequences
+    r"|\s"                            # whitespace between emoji is fine
+    ")+$"
+)
+_CUSTOM_EMOJI_TAG_RE = re.compile(
+    r'<img\b[^>]*\bclass="[^"]*webpublish-custom-emoji[^"]*"[^>]*>', re.IGNORECASE,
+)
+_ANY_TAG_RE = re.compile(r"<[^>]+>")
+_EMOJI_CLUSTER_RE = re.compile(
+    r"(?:"
+    r"[\U0001F000-\U0001FFFF]"
+    r"|[\u2600-\u27BF]"
+    r"|[\U0001F300-\U0001F9FF]"
+    r")[\uFE0F\u200D\u20E3\U000E0020-\U000E007F]*"
+)
+
+
+def _is_emoji_only(body_html: str, max_count: int = 6) -> bool:
+    """True if the rendered HTML body contains only emoji (unicode + custom)
+    with no other text — up to `max_count` emoji units."""
+    if not body_html:
+        return False
+    custom_count = len(_CUSTOM_EMOJI_TAG_RE.findall(body_html))
+    stripped = _CUSTOM_EMOJI_TAG_RE.sub("", body_html)
+    # Strip any remaining HTML tags (e.g. <p>, <br>).
+    stripped = _ANY_TAG_RE.sub("", stripped)
+    stripped = stripped.replace("&nbsp;", " ").strip()
+    if not stripped:
+        return 0 < custom_count <= max_count
+    if not _EMOJI_ONLY_RE.match(stripped):
+        return False
+    unicode_count = len(_EMOJI_CLUSTER_RE.findall(stripped))
+    total = custom_count + unicode_count
+    return 0 < total <= max_count
 
 
 def _render_reply_header(msg: dict) -> str:
@@ -265,6 +319,10 @@ def render_message_html(
     body_html = render_body(msg, homeserver_url, proxy_base_url)
     edited = ' <span class="webpublish-edited">(edited)</span>' if msg.get("edited") else ""
     notice_cls = " webpublish-notice" if msg.get("msgtype") == "m.notice" else ""
+    msgtype = msg.get("msgtype", "m.text")
+    body_cls = "webpublish-body"
+    if msgtype in ("m.text", "m.notice") and _is_emoji_only(body_html):
+        body_cls += " webpublish-emoji-only"
     reply_html = _render_reply_header(msg) if show_reply_header else ""
     raw_avatar = msg.get("avatar_url") or ""
     if raw_avatar:
@@ -273,7 +331,9 @@ def render_message_html(
     else:
         avatar_img = ""
     indicator = f'    {thread_indicator_html}\n' if thread_indicator_html else ""
-    reactions_html = render_reactions_html(msg.get("reactions") or [])
+    reactions_html = render_reactions_html(
+        msg.get("reactions") or [], homeserver_url, proxy_base_url,
+    )
     reactions_section = f'    {reactions_html}\n' if reactions_html else ""
 
     return (
@@ -285,7 +345,7 @@ def render_message_html(
         f'      <span class="webpublish-sender" style="color:{color}">{name}</span>\n'
         f'      <time class="webpublish-timestamp" datetime="{iso}">{time_str}</time>{edited}\n'
         f'    </div>\n'
-        f'    <div class="webpublish-body">{body_html}</div>\n'
+        f'    <div class="{body_cls}">{body_html}</div>\n'
         f'{reactions_section}'
         f'{indicator}'
         f'  </div>\n'
@@ -314,18 +374,29 @@ def _render_mini_avatar(participant: dict, homeserver_url: str, proxy_base_url: 
     )
 
 
-def render_reactions_html(reactions: list[dict]) -> str:
+def render_reactions_html(
+    reactions: list[dict],
+    homeserver_url: str = "",
+    proxy_base_url: str = "",
+) -> str:
     if not reactions:
         return ""
     pills: list[str] = []
     for r in reactions:
         senders = r.get("senders") or []
         title = escape(", ".join(senders))
-        key = escape(r.get("key", ""))
+        raw_key = r.get("key", "") or ""
         count = int(r.get("count", 0))
+        if raw_key.startswith("mxc://"):
+            src = mxc_to_http(raw_key, homeserver_url, proxy_base_url)
+            key_html = (
+                f'<img class="webpublish-custom-emoji" src="{escape(src)}" alt="">'
+            )
+        else:
+            key_html = escape(raw_key)
         pills.append(
             f'<span class="webpublish-reaction" title="{title}">'
-            f'<span class="webpublish-reaction-key">{key}</span>'
+            f'<span class="webpublish-reaction-key">{key_html}</span>'
             f'<span class="webpublish-reaction-count">{count}</span>'
             f'</span>'
         )
@@ -376,7 +447,10 @@ def render_tag_chips(tags: list[str], encoded_alias: str, base_url: str = "") ->
     return f'<div class="webpublish-tags">{"".join(chips)}</div>'
 
 
-def render_post_preview_html(post: dict, alias: str, comment_count: int, base_url: str = "") -> str:
+def render_post_preview_html(
+    post: dict, alias: str, comment_count: int, base_url: str = "",
+    pinned: bool = False,
+) -> str:
     eid = safe_element_id(post["event_id"])
     title_line = (post.get("body") or "").split("\n", 1)[0][:120]
     author = escape(post.get("sender_name") or post["sender"])
@@ -392,10 +466,14 @@ def render_post_preview_html(post: dict, alias: str, comment_count: int, base_ur
         post_url = f"./post/{eid_enc}" if not alias else f"./{alias}/post/{eid_enc}"
     tags_html = render_tag_chips(post.get("tags", []), alias, base_url)
     tags_section = f'\n  {tags_html}' if tags_html else ""
+    pin_badge = '<span class="webpublish-pin-badge" aria-label="Pinned">📌</span> ' if pinned else ""
+    article_cls = "webpublish-post-preview"
+    if pinned:
+        article_cls += " webpublish-post-pinned"
 
     return (
-        f'<article class="webpublish-post-preview" id="{eid}">\n'
-        f'  <h2 class="webpublish-post-title">'
+        f'<article class="{article_cls}" id="{eid}">\n'
+        f'  <h2 class="webpublish-post-title">{pin_badge}'
         f'<a href="{post_url}">{escape(title_line) or "<em>untitled</em>"}</a></h2>\n'
         f'  <div class="webpublish-post-meta">\n'
         f'    <span>{author}</span>\n'
@@ -582,6 +660,29 @@ a:hover { text-decoration: underline; }
 .webpublish-body img.webpublish-media {
   max-width: 400px; max-height: 300px; border-radius: 8px; margin: 4px 0;
 }
+img.webpublish-custom-emoji {
+  height: 1.4em; width: auto; vertical-align: middle; display: inline-block;
+}
+.webpublish-body.webpublish-emoji-only { font-size: 2.2em; line-height: 1.2; }
+.webpublish-body.webpublish-emoji-only img.webpublish-custom-emoji { height: 1em; }
+.webpublish-pinned-banner {
+  background: var(--bg-secondary); border: 1px solid var(--border);
+  border-radius: 8px; margin: 8px 0; padding: 4px 12px;
+}
+.webpublish-pinned-toggle {
+  background: none; border: 0; cursor: pointer; color: var(--text);
+  padding: 4px 0; font: inherit;
+}
+.webpublish-pinned-list { margin: 4px 0 8px 0; padding-left: 20px; }
+.webpublish-pinned-list li { margin: 2px 0; }
+.webpublish-pinned-list a { color: var(--accent); text-decoration: none; }
+.webpublish-pinned-list a:hover { text-decoration: underline; }
+.webpublish-pin-badge { opacity: 0.75; }
+.webpublish-pinned-posts {
+  border-bottom: 2px solid var(--border);
+  padding-bottom: 8px; margin-top: 24px; margin-bottom: 16px;
+}
+.webpublish-post-pinned { background: var(--bg-secondary); border-radius: 8px; padding: 4px 8px; }
 .webpublish-figure { display: inline-block; margin: 4px 0; }
 .webpublish-figure figcaption { font-size: 0.85em; color: var(--text-muted); margin-top: 4px; }
 .webpublish-body pre {
@@ -592,8 +693,14 @@ a:hover { text-decoration: underline; }
 }
 .webpublish-body pre code { background: none; padding: 0; }
 .webpublish-body blockquote {
-  border-left: 3px solid var(--border); padding-left: 12px; color: var(--text-muted); margin: 4px 0;
+  border-left: 3px solid var(--accent); padding-left: 12px; color: var(--accent); margin: 1em 0;
 }
+.webpublish-body h1 { margin: 1.34em 0; }
+.webpublish-body h2 { margin: 1.66em 0; }
+.webpublish-body h3 { margin: 2em 0; }
+.webpublish-body h4 { margin: 2.66em 0; }
+.webpublish-body h5 { margin: 3.34em 0; }
+.webpublish-body h6 { margin: 4.66em 0; }
 .webpublish-notice  { opacity: 0.7; }
 .webpublish-redacted { color: var(--text-muted); }
 
@@ -641,8 +748,14 @@ a:hover { text-decoration: underline; }
 }
 .webpublish-post-full .webpublish-post-body pre code { background: none; padding: 0; }
 .webpublish-post-full .webpublish-post-body blockquote {
-  border-left: 3px solid var(--border); padding-left: 16px; color: var(--text-muted);
+  border-left: 3px solid var(--accent); padding-left: 16px; color: var(--accent); margin: 1em 0;
 }
+.webpublish-post-full .webpublish-post-body h1 { margin: 1.34em 0; }
+.webpublish-post-full .webpublish-post-body h2 { margin: 1.66em 0; }
+.webpublish-post-full .webpublish-post-body h3 { margin: 2em 0; }
+.webpublish-post-full .webpublish-post-body h4 { margin: 2.66em 0; }
+.webpublish-post-full .webpublish-post-body h5 { margin: 3.34em 0; }
+.webpublish-post-full .webpublish-post-body h6 { margin: 4.66em 0; }
 /* full-width image figures in journal post detail */
 .webpublish-figure-full { display: block; margin: 0 0 4px; }
 .webpublish-figure-full img.webpublish-media { max-width: 100%; max-height: none; border-radius: 8px; }
@@ -989,6 +1102,19 @@ def _sse_chat_script(encoded_alias: str) -> str:
         '  src.addEventListener("reaction_removed", function(e) {\n'
         '    applyReactionsBoth(JSON.parse(e.data));\n'
         '  });\n'
+        '  src.addEventListener("pinned_changed", function(e) {\n'
+        '    var d = JSON.parse(e.data);\n'
+        '    var existing = document.querySelector(".webpublish-pinned-banner");\n'
+        '    if (d.banner_html) {\n'
+        '      if (existing) { existing.outerHTML = d.banner_html; }\n'
+        '      else {\n'
+        '        var header = document.querySelector(".webpublish-header");\n'
+        '        if (header) header.insertAdjacentHTML("beforeend", d.banner_html);\n'
+        '      }\n'
+        '    } else if (existing) {\n'
+        '      existing.remove();\n'
+        '    }\n'
+        '  });\n'
         '})();\n'
         '</script>'
     )
@@ -1099,6 +1225,24 @@ def _sse_journal_landing_script(encoded_alias: str) -> str:
         '    var el = document.getElementById(d.element_id);\n'
         '    if (el) el.remove();\n'
         '  });\n'
+        '  src.addEventListener("post_unpublished", function(e) {\n'
+        '    var d = JSON.parse(e.data);\n'
+        '    var el = document.getElementById(d.element_id);\n'
+        '    if (el) el.remove();\n'
+        '  });\n'
+        '  src.addEventListener("pinned_changed", function(e) {\n'
+        '    var d = JSON.parse(e.data);\n'
+        '    var existing = document.querySelector(".webpublish-pinned-posts");\n'
+        '    if (d.html) {\n'
+        '      if (existing) { existing.outerHTML = d.html; }\n'
+        '      else {\n'
+        '        var main = document.querySelector(".webpublish-journal");\n'
+        '        if (main) main.insertAdjacentHTML("afterbegin", d.html);\n'
+        '      }\n'
+        '    } else if (existing) {\n'
+        '      existing.remove();\n'
+        '    }\n'
+        '  });\n'
         '})();\n'
         '</script>'
     )
@@ -1152,6 +1296,14 @@ def _sse_post_detail_script(post_event_id: str) -> str:
         '    var d = JSON.parse(e.data);\n'
         '    var el = document.getElementById(d.element_id);\n'
         '    if (el) el.remove();\n'
+        '  });\n'
+        '  src.addEventListener("post_unpublished", function(e) {\n'
+        '    var d = JSON.parse(e.data);\n'
+        '    if (d.event_id === postId) {\n'
+        '      // The currently-viewed post was unpublished; reload to get the\n'
+        '      // authoritative 404 from the server.\n'
+        '      window.location.reload();\n'
+        '    }\n'
         '  });\n'
         '  function handleReactions(e) {\n'
         '    var d = JSON.parse(e.data);\n'
@@ -1231,6 +1383,95 @@ def _scroll_header_script() -> str:
     )
 
 
+def render_pinned_banner_html(
+    pinned_msgs: list[dict],
+    room_id: str,
+    homeserver_url: str,
+) -> str:
+    """Chat-mode banner listing pinned messages with anchor links to in-feed
+    elements. Messages whose bodies we don't have render as matrix.to links."""
+    if not pinned_msgs:
+        return ""
+    items: list[str] = []
+    for m in pinned_msgs:
+        eid = m.get("event_id", "")
+        if not eid:
+            continue
+        sender = escape(m.get("sender_name") or m.get("sender", ""))
+        preview = (m.get("body") or "").strip().split("\n", 1)[0][:80]
+        preview_html = escape(preview) if preview else "<em>(no text)</em>"
+        if m.get("in_db"):
+            href = f"#{safe_element_id(eid)}"
+            items.append(
+                f'<li><a href="{href}">{preview_html}</a>'
+                f' <span class="webpublish-pinned-sender">— {sender}</span></li>'
+            )
+        else:
+            mx_href = (
+                f"https://matrix.to/#/{quote(room_id)}/{quote(eid)}"
+            )
+            items.append(
+                f'<li><a href="{escape(mx_href)}" target="_blank" rel="noopener">'
+                f'View in Matrix</a>'
+                f' <span class="webpublish-pinned-sender">— {sender}</span></li>'
+            )
+    if not items:
+        return ""
+    count = len(items)
+    label = f"{count} pinned message{'s' if count != 1 else ''}"
+    return (
+        f'<div class="webpublish-pinned-banner" data-count="{count}">\n'
+        f'  <button class="webpublish-pinned-toggle" type="button" aria-expanded="false">'
+        f'📌 <span class="webpublish-pinned-count">{label}</span></button>\n'
+        f'  <ul class="webpublish-pinned-list" hidden>{"".join(items)}</ul>\n'
+        f'</div>'
+    )
+
+
+def render_pinned_section_html(
+    pinned_msgs: list[dict],
+    encoded_alias: str,
+    comment_counts: dict[str, int],
+    base_url: str = "",
+) -> str:
+    """Journal-mode sticky section — rendered above the regular post list on
+    page 1. `pinned_msgs` must only contain rows that exist in the DB."""
+    if not pinned_msgs:
+        return ""
+    parts = [
+        render_post_preview_html(
+            p, encoded_alias, comment_counts.get(p["event_id"], 0),
+            base_url, pinned=True,
+        )
+        for p in pinned_msgs
+    ]
+    return (
+        '<section class="webpublish-pinned-posts" aria-label="Pinned posts">\n'
+        + "\n".join(parts)
+        + "\n</section>"
+    )
+
+
+def _pinned_toggle_script() -> str:
+    return (
+        '<script>\n'
+        '(function() {\n'
+        '  document.addEventListener("click", function(e) {\n'
+        '    var btn = e.target.closest(".webpublish-pinned-toggle");\n'
+        '    if (!btn) return;\n'
+        '    var banner = btn.closest(".webpublish-pinned-banner");\n'
+        '    if (!banner) return;\n'
+        '    var list = banner.querySelector(".webpublish-pinned-list");\n'
+        '    if (!list) return;\n'
+        '    var expanded = btn.getAttribute("aria-expanded") === "true";\n'
+        '    btn.setAttribute("aria-expanded", expanded ? "false" : "true");\n'
+        '    list.hidden = expanded;\n'
+        '  });\n'
+        '})();\n'
+        '</script>'
+    )
+
+
 def _render_room_avatar_img(room_avatar_url: str, proxy_base_url: str) -> str:
     if not room_avatar_url or not proxy_base_url:
         return ""
@@ -1256,6 +1497,7 @@ def render_chat_page(
     room_avatar_url: str = "",
     comment_counts: dict[str, int] | None = None,
     thread_participants: dict[str, list[dict]] | None = None,
+    pinned_banner_html: str = "",
 ) -> str:
     counts = comment_counts or {}
     parts = thread_participants or {}
@@ -1279,19 +1521,22 @@ def render_chat_page(
     ) if room_topic else ""
     sse = _sse_chat_script(encoded_alias)
     panel_script = _thread_panel_script(encoded_alias)
+    pinned_script = _pinned_toggle_script()
     leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
     scroll_script = _scroll_header_script()
     avatar_img = _render_room_avatar_img(room_avatar_url, proxy_base_url)
+    banner_block = f'\n{pinned_banner_html}' if pinned_banner_html else ''
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
-        f'  <div class="webpublish-header-title">{avatar_img}<h1>{escape(room_name)}</h1></div>\n{topic_p}\n'
+        f'  <div class="webpublish-header-title">{avatar_img}<h1>{escape(room_name)}</h1></div>\n{topic_p}'
+        f'{banner_block}\n'
         f'</header>\n'
         f'<main class="webpublish-chat">\n'
         f'  <div class="webpublish-messages" id="messages">\n{msgs_html}\n  </div>\n'
         f'</main>\n'
         f'<aside class="webpublish-thread-panel" id="thread-panel" hidden></aside>\n'
-        f'{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n{panel_script}\n{scroll_script}\n'
+        f'{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n{panel_script}\n{pinned_script}\n{scroll_script}\n'
         f'</body>\n</html>'
     )
 
@@ -1339,6 +1584,7 @@ def render_journal_landing(
     comment_counts: dict[str, int],
     base_url: str = "",
     room_avatar_url: str = "",
+    pinned_section_html: str = "",
 ) -> str:
     og = _og_meta_site(room_name, room_topic, encoded_alias, base_url, room_avatar_url, base_url) if base_url else ""
     head = _page_head(room_name, custom_css, og_meta=og)
@@ -1352,6 +1598,7 @@ def render_journal_landing(
         count = comment_counts.get(post["event_id"], 0)
         posts_parts.append(render_post_preview_html(post, encoded_alias, count, base_url))
     posts_html = "\n".join(posts_parts)
+    pinned_block = f'{pinned_section_html}\n' if pinned_section_html else ''
 
     pag_parts: list[str] = []
     if total_pages > 1:
@@ -1380,6 +1627,7 @@ def render_journal_landing(
         f'  <div class="webpublish-header-title">{avatar_img}<h1>{escape(room_name)}</h1></div>\n{topic_p}\n'
         f'</header>\n'
         f'<main class="webpublish-journal">\n'
+        f'  {pinned_block}'
         f'  <div class="webpublish-posts">\n{posts_html}\n  </div>\n'
         f'  {pag_html}\n'
         f'{feed_footer}'
@@ -1411,7 +1659,9 @@ def render_journal_post(
     tags_html = render_tag_chips(tags, encoded_alias, proxy_base_url)
     tags_section = f'\n    {tags_html}' if tags_html else ""
 
-    post_reactions_html = render_reactions_html(post.get("reactions") or [])
+    post_reactions_html = render_reactions_html(
+        post.get("reactions") or [], homeserver_url, proxy_base_url,
+    )
     post_reactions_section = f'    {post_reactions_html}\n' if post_reactions_html else ""
 
     comments_parts = [

@@ -23,6 +23,8 @@ from .templates import (
     render_journal_landing,
     render_journal_post,
     render_message_html,
+    render_pinned_banner_html,
+    render_pinned_section_html,
     render_post_preview_html,
     render_reactions_html,
     render_tag_filter_page,
@@ -119,7 +121,10 @@ class WebPublishBot(Plugin):
         self._tile_cache_max: int = 256
         self._room_create_cache: dict[str, tuple[int, set[str]]] = {}
         self._room_config_overrides: dict[str, dict[str, Any]] = {}
+        self._pinned_events: dict[str, list[str]] = {}  # room_id -> ordered pinned event_ids
         await self._load_published_rooms()
+        for rid in list(self._published.keys()):
+            self._pinned_events[rid] = await self._get_pinned_events(rid)
 
     async def stop(self) -> None:
         for queues in self._sse_queues.values():
@@ -174,6 +179,7 @@ class WebPublishBot(Plugin):
             if default_alias and default_alias != info["alias"]:
                 self._alias_to_room.pop(default_alias, None)
                 self._redirect_aliases.pop(default_alias, None)
+        self._pinned_events.pop(room_id, None)
         await self.database.execute(
             "DELETE FROM published_rooms WHERE room_id = $1", room_id
         )
@@ -230,7 +236,10 @@ class WebPublishBot(Plugin):
 
     async def _get_posts(
         self, room_id: str, page: int, per_page: int,
+        exclude_event_ids: list[str] | None = None,
     ) -> tuple[list[dict], int]:
+        # total_pages always reflects the full post set so pagination stays
+        # stable across requests that exclude pinned posts on page 1 only.
         total = await self.database.fetchval(
             "SELECT COUNT(*) FROM messages "
             "WHERE room_id=$1 AND thread_root IS NULL AND redacted=FALSE AND published=TRUE",
@@ -238,6 +247,17 @@ class WebPublishBot(Plugin):
         ) or 0
         total_pages = max(1, (total + per_page - 1) // per_page)
         offset = (page - 1) * per_page
+        exclude = exclude_event_ids or []
+        if exclude:
+            placeholders = ",".join(f"${i + 2}" for i in range(len(exclude)))
+            rows = await self.database.fetch(
+                f"SELECT * FROM messages "
+                f"WHERE room_id=$1 AND thread_root IS NULL AND redacted=FALSE "
+                f"AND published=TRUE AND event_id NOT IN ({placeholders}) "
+                f"ORDER BY timestamp DESC LIMIT ${len(exclude) + 2} OFFSET ${len(exclude) + 3}",
+                room_id, *exclude, per_page, offset,
+            )
+            return [dict(r) for r in rows], total_pages
         rows = await self.database.fetch(
             "SELECT * FROM messages "
             "WHERE room_id=$1 AND thread_root IS NULL AND redacted=FALSE AND published=TRUE "
@@ -313,6 +333,30 @@ class WebPublishBot(Plugin):
         await self.database.execute(
             "UPDATE messages SET published=TRUE WHERE event_id=$1", event_id
         )
+
+    async def _unpublish_post(self, event_id: str) -> None:
+        await self.database.execute(
+            "UPDATE messages SET published=FALSE WHERE event_id=$1", event_id
+        )
+
+    async def _has_privileged_publish_reaction(
+        self, room_id: str, target_id: str,
+    ) -> bool:
+        """True iff at least one non-redacted 📰 reaction on target_id has a
+        sender whose current power level meets journal_author_pl."""
+        rows = await self.database.fetch(
+            "SELECT DISTINCT sender FROM reactions "
+            "WHERE target_event_id=$1 AND key=$2 AND redacted=FALSE",
+            target_id, "📰",
+        )
+        if not rows:
+            return False
+        author_pl = self._get_room_config(room_id, "journal_author_pl")
+        for row in rows:
+            user_level = await self._get_effective_power_level(room_id, row["sender"])
+            if user_level >= author_pl:
+                return True
+        return False
 
     async def _store_tags(self, event_id: str, room_id: str, body: str) -> None:
         tags = parse_hashtags(body)
@@ -407,9 +451,11 @@ class WebPublishBot(Plugin):
             reaction_event_id, target_event_id, room_id, sender, key, timestamp,
         )
 
-    async def _mark_reaction_redacted(self, reaction_event_id: str) -> tuple[str, str] | None:
+    async def _mark_reaction_redacted(
+        self, reaction_event_id: str,
+    ) -> tuple[str, str, str] | None:
         row = await self.database.fetchrow(
-            "SELECT target_event_id, room_id FROM reactions "
+            "SELECT target_event_id, room_id, key FROM reactions "
             "WHERE reaction_event_id=$1 AND redacted=FALSE",
             reaction_event_id,
         )
@@ -419,7 +465,7 @@ class WebPublishBot(Plugin):
             "UPDATE reactions SET redacted=TRUE WHERE reaction_event_id=$1",
             reaction_event_id,
         )
-        return (row["target_event_id"], row["room_id"])
+        return (row["target_event_id"], row["room_id"], row["key"])
 
     async def _get_reactions_for_events(
         self, event_ids: list[str],
@@ -487,7 +533,7 @@ class WebPublishBot(Plugin):
         reactions = (await self._get_reactions_for_events([event_id])).get(event_id, [])
         if reactions and self._should_hide_publish_emoji(room_id, target_dict):
             reactions = [r for r in reactions if r["key"] != "📰"]
-        return render_reactions_html(reactions)
+        return render_reactions_html(reactions, self._homeserver_url(), self._base_url)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -537,6 +583,91 @@ class WebPublishBot(Plugin):
             url = ""
         self._room_avatars[room_id] = url
         return url
+
+    async def _get_pinned_events(self, room_id: str) -> list[str]:
+        try:
+            content = await self.client.api.request(
+                Method.GET,
+                Path.v3.rooms[room_id].state["m.room.pinned_events"],
+            )
+            pinned = content.get("pinned", []) if isinstance(content, dict) else []
+            return [str(e) for e in pinned if isinstance(e, str)]
+        except Exception as e:
+            self.log.debug(f"Could not fetch pinned events for {room_id}: {e}")
+            return []
+
+    async def _hydrate_pinned_messages(self, room_id: str) -> list[dict]:
+        """Return DB rows for pinned event_ids that exist locally and are
+        non-redacted, preserving pin order. Missing ids are skipped."""
+        pinned_ids = self._pinned_events.get(room_id, [])
+        if not pinned_ids:
+            return []
+        placeholders = ",".join(f"${i + 2}" for i in range(len(pinned_ids)))
+        rows = await self.database.fetch(
+            f"SELECT * FROM messages "
+            f"WHERE room_id=$1 AND redacted=FALSE AND event_id IN ({placeholders})",
+            room_id, *pinned_ids,
+        )
+        by_id = {r["event_id"]: dict(r) for r in rows}
+        return [by_id[eid] for eid in pinned_ids if eid in by_id]
+
+    async def _hydrate_chat_pinned_for_banner(
+        self, room_id: str,
+    ) -> list[dict]:
+        """Chat banner needs a row per pinned id, whether we have it locally
+        or not. Missing rows get `in_db=False` and a placeholder sender."""
+        pinned_ids = self._pinned_events.get(room_id, [])
+        if not pinned_ids:
+            return []
+        hydrated = await self._hydrate_pinned_messages(room_id)
+        by_id = {m["event_id"]: m for m in hydrated}
+        result: list[dict] = []
+        for eid in pinned_ids:
+            if eid in by_id:
+                m = dict(by_id[eid])
+                m["in_db"] = True
+                result.append(m)
+            else:
+                result.append({
+                    "event_id": eid,
+                    "sender": "",
+                    "sender_name": "",
+                    "body": "",
+                    "in_db": False,
+                })
+        return result
+
+    async def _build_pinned_payload(
+        self, room_id: str, mode: str | None,
+    ) -> dict | None:
+        if mode == "chat":
+            pinned = await self._hydrate_chat_pinned_for_banner(room_id)
+            banner = render_pinned_banner_html(
+                pinned, room_id, self._homeserver_url(),
+            )
+            return {"banner_html": banner}
+        if mode == "journal":
+            pinned = await self._hydrate_pinned_messages(room_id)
+            # Only include published top-level posts.
+            pinned = [
+                m for m in pinned
+                if m.get("thread_root") is None and m.get("published")
+            ]
+            counts: dict[str, int] = {}
+            if pinned:
+                eids = [m["event_id"] for m in pinned]
+                counts = await self._get_comment_counts(eids)
+                tags = await self._get_tags_for_posts(eids)
+                for m in pinned:
+                    m["tags"] = tags.get(m["event_id"], [])
+            info = self._published.get(room_id) or {}
+            alias = info.get("alias", "")
+            encoded = "" if alias == "/" else alias
+            html = render_pinned_section_html(
+                pinned, encoded, counts, self._base_url,
+            )
+            return {"html": html}
+        return None
 
     async def _get_room_create_info(self, room_id: str) -> tuple[int, set[str]]:
         """Return (room_version, set_of_creator_mxids) for the room, cached."""
@@ -896,6 +1027,7 @@ class WebPublishBot(Plugin):
             alias_str = str(alias).lstrip("#")
 
         await self._set_published(room_id, mode, alias_str)
+        self._pinned_events[room_id] = await self._get_pinned_events(room_id)
 
         url = f"{self._base_url}/" if alias_str == "/" else f"{self._base_url}/{alias_str}"
         await evt.reply(f"Room published in **{mode}** mode!\n\n{url}")
@@ -1312,7 +1444,7 @@ class WebPublishBot(Plugin):
         # target's reactions strip and stop — the id is not a message.
         reaction_entry = await self._mark_reaction_redacted(redacted_id)
         if reaction_entry is not None:
-            target_id, target_room = reaction_entry
+            target_id, target_room, reaction_key = reaction_entry
             if target_room != evt.room_id:
                 return
             reactions_html = await self._reactions_html_for_event(
@@ -1323,6 +1455,27 @@ class WebPublishBot(Plugin):
                 "element_id": safe_element_id(target_id),
                 "reactions_html": reactions_html,
             })
+            # Unpublish if the last privileged 📰 reaction has been redacted.
+            if reaction_key == "📰":
+                info = self._published.get(evt.room_id)
+                emoji_publish = self._get_room_config(
+                    evt.room_id, "journal_emoji_publish",
+                )
+                if info and info["mode"] == "journal" and emoji_publish:
+                    target = await self._get_post_internal(target_id)
+                    if (
+                        target
+                        and target["thread_root"] is None
+                        and target["published"]
+                        and not await self._has_privileged_publish_reaction(
+                            evt.room_id, target_id,
+                        )
+                    ):
+                        await self._unpublish_post(target_id)
+                        self._notify_sse(evt.room_id, "post_unpublished", {
+                            "element_id": safe_element_id(target_id),
+                            "event_id": target_id,
+                        })
             return
 
         # Capture thread_root before the row is deleted so we can update the
@@ -1438,6 +1591,24 @@ class WebPublishBot(Plugin):
         if not isinstance(content, dict):
             content = {}
         self._room_config_overrides[evt.room_id] = dict(content)
+
+    @event.on(EventType.find("m.room.pinned_events", t_class=EventType.Class.STATE))
+    async def handle_pinned_state(self, evt) -> None:
+        if evt.room_id not in self._published:
+            return
+        if getattr(evt, "state_key", "") != "":
+            return
+        content = evt.content
+        if hasattr(content, "serialize"):
+            content = content.serialize()
+        pinned = content.get("pinned", []) if isinstance(content, dict) else []
+        self._pinned_events[evt.room_id] = [
+            str(e) for e in pinned if isinstance(e, str)
+        ]
+        info = self._published.get(evt.room_id) or {}
+        payload = await self._build_pinned_payload(evt.room_id, info.get("mode"))
+        if payload is not None:
+            self._notify_sse(evt.room_id, "pinned_changed", payload)
 
     # ------------------------------------------------------------------
     # Web handlers
@@ -1670,16 +1841,41 @@ class WebPublishBot(Plugin):
             eids = [m["event_id"] for m in messages]
             comment_counts = await self._get_comment_counts(eids)
             thread_participants = await self._get_thread_participants(eids, 6)
+            pinned_chat = await self._hydrate_chat_pinned_for_banner(room_id)
+            pinned_banner = render_pinned_banner_html(
+                pinned_chat, room_id, hs,
+            )
             html = render_chat_page(
                 room_name, room_topic, messages, encoded, css, hs, self._base_url,
                 room_avatar_url=room_avatar_url,
                 comment_counts=comment_counts,
                 thread_participants=thread_participants,
+                pinned_banner_html=pinned_banner,
             )
         else:
             page = int(req.query.get("page", "1"))
             per_page = self._get_room_config(room_id, "pagination")
-            posts, total_pages = await self._get_posts(room_id, page, per_page)
+            pinned_section_html = ""
+            exclude: list[str] = []
+            if page == 1:
+                pinned_posts = await self._hydrate_pinned_messages(room_id)
+                pinned_posts = [
+                    p for p in pinned_posts
+                    if p.get("thread_root") is None and p.get("published")
+                ]
+                if pinned_posts:
+                    p_eids = [p["event_id"] for p in pinned_posts]
+                    p_counts = await self._get_comment_counts(p_eids)
+                    p_tags = await self._get_tags_for_posts(p_eids)
+                    for p in pinned_posts:
+                        p["tags"] = p_tags.get(p["event_id"], [])
+                    pinned_section_html = render_pinned_section_html(
+                        pinned_posts, encoded, p_counts, self._base_url,
+                    )
+                    exclude = p_eids
+            posts, total_pages = await self._get_posts(
+                room_id, page, per_page, exclude_event_ids=exclude,
+            )
             eids = [p["event_id"] for p in posts]
             counts = await self._get_comment_counts(eids)
             post_tags = await self._get_tags_for_posts(eids)
@@ -1690,6 +1886,7 @@ class WebPublishBot(Plugin):
                 page, total_pages, css, counts,
                 base_url=self._base_url,
                 room_avatar_url=room_avatar_url,
+                pinned_section_html=pinned_section_html,
             )
 
         return Response(text=html, content_type="text/html",
