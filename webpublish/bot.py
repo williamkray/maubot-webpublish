@@ -1381,6 +1381,7 @@ class WebPublishBot(Plugin):
             "geo_uri": geo_uri,
             "edited": False,
             "redacted": False,
+            "avatar_url": sender_avatar,
         }
         await self._enrich_single_reply(msg_dict)
 
