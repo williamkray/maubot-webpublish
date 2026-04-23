@@ -593,6 +593,7 @@ BASE_CSS = """\
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   background: var(--bg); color: var(--text); line-height: 1.5;
+  min-height: 100dvh;
 }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -626,7 +627,9 @@ a:hover { text-decoration: underline; }
 }
 
 /* ---- chat mode ---- */
-.webpublish-chat { display: flex; flex-direction: column; height: calc(100vh - 85px); }
+body.webpublish-chat-mode { height: 100dvh; overflow: hidden; display: flex; flex-direction: column; }
+body.webpublish-chat-mode .webpublish-header { flex: 0 0 auto; }
+.webpublish-chat { display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; }
 .webpublish-messages { flex: 1; overflow-y: auto; padding: 16px 32px; }
 .webpublish-message { display: flex; gap: 12px; padding: 8px 0; }
 .webpublish-message:hover { background: rgba(255,255,255,0.02); border-radius: 4px; }
@@ -992,23 +995,6 @@ def _sse_chat_script(encoded_alias: str) -> str:
         '(function() {\n'
         '  var msgs = document.getElementById("messages");\n'
         '  var panel = document.getElementById("thread-panel");\n'
-        '  var chat = document.querySelector(".webpublish-chat");\n'
-        '  var header = document.querySelector(".webpublish-header");\n'
-        '  // BASE_CSS sets `.webpublish-chat { height: calc(100vh - 85px) }`,\n'
-        '  // which misjudges the real header height when a topic paragraph\n'
-        '  // wraps to multiple lines on a wide viewport — the inner scroll\n'
-        '  // container extends past the viewport bottom, so scrolling to the\n'
-        '  // "bottom" hides the last message. Size it to the real header\n'
-        '  // height instead, and re-measure on resize.\n'
-        '  function fitChat() {\n'
-        '    if (!chat || !header) return;\n'
-        '    chat.style.height = (window.innerHeight - header.offsetHeight) + "px";\n'
-        '  }\n'
-        '  fitChat();\n'
-        '  window.addEventListener("resize", fitChat, {passive: true});\n'
-        '  if (window.ResizeObserver && header) {\n'
-        '    new ResizeObserver(fitChat).observe(header);\n'
-        '  }\n'
         '  function isNearBottom() {\n'
         '    return msgs.scrollHeight - msgs.clientHeight <= msgs.scrollTop + 80;\n'
         '  }\n'
@@ -1367,21 +1353,20 @@ def _scroll_header_script() -> str:
         '  function getScrollY() {\n'
         '    return scroller === window ? window.scrollY : scroller.scrollTop;\n'
         '  }\n'
+        '  // Hysteresis: different thresholds to enter vs leave the collapsed\n'
+        '  // state so scroll jitter and mobile address-bar transitions near a\n'
+        '  // single threshold cannot oscillate the class.\n'
+        '  var ADD_AT = 80;\n'
+        '  var REMOVE_AT = 20;\n'
         '  function update() {\n'
         '    if (header.classList.contains("expanded") || !mq.matches) {\n'
         '      header.classList.remove("scrolled");\n'
         '      return;\n'
         '    }\n'
-        '    // Only collapse when the page has enough scroll room that shrinking\n'
-        '    // the header will not push scrollHeight below viewport height (which\n'
-        '    // would clamp scrollY and oscillate the scrolled/unscrolled state).\n'
-        '    var docH = scroller === window ? document.documentElement.scrollHeight : scroller.scrollHeight;\n'
-        '    var vpH  = scroller === window ? window.innerHeight : scroller.clientHeight;\n'
-        '    if (getScrollY() > 10 && (docH - vpH) > 100) {\n'
-        '      header.classList.add("scrolled");\n'
-        '    } else {\n'
-        '      header.classList.remove("scrolled");\n'
-        '    }\n'
+        '    var y = getScrollY();\n'
+        '    var isScrolled = header.classList.contains("scrolled");\n'
+        '    if (!isScrolled && y > ADD_AT) header.classList.add("scrolled");\n'
+        '    else if (isScrolled && y < REMOVE_AT) header.classList.remove("scrolled");\n'
         '  }\n'
         '  function checkOverflow() {\n'
         '    if (!topic || !toggle) return;\n'
@@ -1561,7 +1546,7 @@ def render_chat_page(
     avatar_img = _render_room_avatar_img(room_avatar_url, proxy_base_url)
     banner_block = f'\n{pinned_banner_html}' if pinned_banner_html else ''
     return (
-        f'{head}\n<body>\n'
+        f'{head}\n<body class="webpublish-chat-mode">\n'
         f'<header class="webpublish-header">\n'
         f'  <div class="webpublish-header-title">{avatar_img}<h1>{escape(room_name)}</h1></div>\n{topic_p}'
         f'{banner_block}\n'
