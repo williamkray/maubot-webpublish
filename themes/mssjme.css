@@ -1,0 +1,169 @@
+/* mssj-theme.css
+ * A webpublish theme that matches https://www.mssj.me/ (HTML5 UP "Story"
+ * family). Drop-in: either host this file and @import it from the plugin's
+ * `css` config, or paste the whole body inline.
+ *
+ *   css: '@import url("https://your.host/path/mssj-theme.css");'
+ *
+ * Colors (from mssj.me main.css):
+ *   background gradient #492E46 -> #1d121c at 45deg, base #935d8c
+ *   accent blue #8cc9f0
+ *   pastel underline gradient #efa8b0 -> #c79cc8 -> #a89cc8 -> #8cc9f0
+ *   text rgba(255,255,255,0.75), headings #ffffff
+ */
+
+@import url("https://fonts.googleapis.com/css2?family=Source+Sans+Pro:wght@300;400;600;700&display=swap");
+
+:root {
+  --bg: #492E46;
+  --bg-secondary: rgba(255, 255, 255, 0.06);
+  --text: rgba(255, 255, 255, 0.85);
+  --text-muted: rgba(255, 255, 255, 0.55);
+  --border: rgba(255, 255, 255, 0.22);
+  --accent: #8cc9f0;
+  --code-bg: rgba(255, 255, 255, 0.08);
+}
+
+html, body {
+  background: #935d8c;
+  background: linear-gradient(45deg, #492E46 15%, #1d121c 85%) fixed;
+  color: rgba(255, 255, 255, 0.75);
+  font-family: "Source Sans Pro", Helvetica, sans-serif;
+  font-weight: 400;
+  line-height: 1.65;
+  letter-spacing: 0.01em;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  color: #ffffff;
+  font-weight: 300;
+  letter-spacing: -0.025em;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+  border-bottom: dotted 1px rgba(255, 255, 255, 0.5);
+  transition: color 0.2s ease, border-bottom-color 0.2s ease;
+}
+a:hover {
+  color: #ffffff;
+  border-bottom-color: transparent;
+  text-decoration: none;
+}
+
+/* Header: paint the same fixed 45° gradient as the page behind it. Because
+ * both are `background-attachment: fixed`, the gradient on the header
+ * aligns seamlessly with the gradient on the page — so the header looks
+ * like a continuation of the background while still being fully opaque
+ * (scrolled content can't bleed through).
+ *
+ * Do not set `position: relative` here — the BASE_CSS sets `position:
+ * sticky`; overriding it unsticks the header. Sticky already establishes a
+ * containing block for the ::after rule below.
+ */
+.webpublish-header {
+  background: linear-gradient(45deg, #492E46 15%, #1d121c 85%) fixed;
+  border-bottom: none;
+}
+.webpublish-header::after {
+  content: "";
+  position: absolute;
+  left: 5%;
+  right: 5%;
+  bottom: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #efa8b0, #c79cc8 33%, #a89cc8 66%, #8cc9f0);
+}
+.webpublish-header h1 {
+  font-weight: 300;
+  letter-spacing: -0.025em;
+}
+
+/* Journal post cards: translucent glass with the site's signature shadow */
+.webpublish-post-preview {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  box-shadow: 2px 2px 5px 0 rgba(0, 0, 0, 0.5);
+}
+.webpublish-post-preview:hover { border-color: #8cc9f0; }
+.webpublish-post-title a {
+  color: #ffffff;
+  border-bottom: none;
+}
+.webpublish-post-title a:hover { color: #8cc9f0; }
+.webpublish-post-pinned { background: rgba(140, 201, 240, 0.08); }
+
+/* Chat message hover + sender color */
+.webpublish-message:hover {
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 8px;
+}
+.webpublish-sender {
+  font-weight: 600;
+  color: #ffffff;
+}
+
+/* Pinned banner */
+.webpublish-pinned-banner {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+
+/* Reactions, thread indicator, tag chips: glassy pills */
+.webpublish-reaction,
+.webpublish-thread-indicator,
+.webpublish-tag-chip {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 8px;
+}
+.webpublish-reaction:hover,
+.webpublish-thread-indicator:hover,
+.webpublish-tag-chip:hover {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+/* Code blocks */
+.webpublish-body code,
+.webpublish-body pre {
+  border-radius: 8px;
+  border: solid 1px rgba(255, 255, 255, 0.18);
+}
+.webpublish-body pre { background: rgba(0, 0, 0, 0.25); }
+
+/* Block quotes use the signature blue */
+.webpublish-body blockquote {
+  border-left: 3px solid #8cc9f0;
+  color: #ffffff;
+}
+
+/* Pagination: inset-border pill buttons matching site's button style */
+.webpublish-pagination a,
+.webpublish-pagination span.active {
+  border-radius: 8px;
+  padding: 4px 12px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35);
+  border-bottom: none;
+}
+.webpublish-pagination a:hover { background: rgba(255, 255, 255, 0.1); }
+.webpublish-pagination span.active {
+  background: #8cc9f0;
+  color: #ffffff;
+  box-shadow: inset 0 0 0 1px #8cc9f0;
+}
+
+/* Atom feed footer link keeps the accent colour */
+.webpublish-feed-footer a { color: #8cc9f0; }
+
+/* Subtle scrollbars to match the dark glass look */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.3); }
