@@ -676,6 +676,25 @@ img.webpublish-custom-emoji {
   background: none; border: 0; cursor: pointer; color: var(--text);
   padding: 4px 0; font: inherit;
 }
+.webpublish-header-actions {
+  display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; align-items: center;
+}
+.webpublish-header-actions:not(:has(> :not([hidden]))) { display: none; }
+body.webpublish-chat-mode .webpublish-pinned-banner {
+  display: contents;
+}
+body.webpublish-chat-mode .webpublish-pinned-toggle,
+.webpublish-jump-latest {
+  background: var(--bg-secondary); border: 1px solid var(--border);
+  border-radius: 8px; padding: 4px 12px; cursor: pointer;
+  color: var(--text); font: inherit;
+}
+body.webpublish-chat-mode .webpublish-pinned-list {
+  order: 2; flex: 0 0 100%;
+  background: var(--bg-secondary); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 12px 8px 32px; margin: 0;
+}
+.webpublish-jump-latest[hidden] { display: none; }
 .webpublish-pinned-list { margin: 4px 0 8px 0; padding-left: 20px; }
 .webpublish-pinned-list li { margin: 2px 0; }
 .webpublish-pinned-list a { color: var(--accent); text-decoration: none; }
@@ -1044,9 +1063,22 @@ def _sse_chat_script(encoded_alias: str) -> str:
         '  msgs.querySelectorAll("img").forEach(function(img) {\n'
         '    if (!img.complete) img.addEventListener("load", maybeKeepBottom, {once: true});\n'
         '  });\n'
+        '  var jumpBtn = document.querySelector(".webpublish-jump-latest");\n'
+        '  function updateJumpBtn() {\n'
+        '    if (!jumpBtn) return;\n'
+        '    jumpBtn.hidden = isNearBottom();\n'
+        '  }\n'
+        '  if (jumpBtn) {\n'
+        '    jumpBtn.addEventListener("click", function() {\n'
+        '      initialBottom = true;\n'
+        '      msgs.scrollTo({top: msgs.scrollHeight, behavior: "smooth"});\n'
+        '    });\n'
+        '  }\n'
+        '  updateJumpBtn();\n'
         '  // Once the user scrolls away from the bottom we stop forcing it.\n'
         '  msgs.addEventListener("scroll", function() {\n'
         '    if (!isNearBottom()) initialBottom = false;\n'
+        '    updateJumpBtn();\n'
         '  }, {passive: true});\n'
         f'  var src = new EventSource("{sse_url}");\n'
         '  src.addEventListener("new_message", function(e) {\n'
@@ -1126,8 +1158,8 @@ def _sse_chat_script(encoded_alias: str) -> str:
         '    if (d.banner_html) {\n'
         '      if (existing) { existing.outerHTML = d.banner_html; }\n'
         '      else {\n'
-        '        var header = document.querySelector(".webpublish-header");\n'
-        '        if (header) header.insertAdjacentHTML("beforeend", d.banner_html);\n'
+        '        var actions = document.querySelector(".webpublish-header-actions");\n'
+        '        if (actions) actions.insertAdjacentHTML("afterbegin", d.banner_html);\n'
         '      }\n'
         '    } else if (existing) {\n'
         '      existing.remove();\n'
@@ -1544,12 +1576,17 @@ def render_chat_page(
     leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
     scroll_script = _scroll_header_script()
     avatar_img = _render_room_avatar_img(room_avatar_url, proxy_base_url)
-    banner_block = f'\n{pinned_banner_html}' if pinned_banner_html else ''
+    actions_inner = (
+        f'{pinned_banner_html}\n  ' if pinned_banner_html else ''
+    ) + (
+        '<button class="webpublish-jump-latest" type="button" hidden>'
+        '&#x2B07; Jump to newest</button>'
+    )
     return (
         f'{head}\n<body class="webpublish-chat-mode">\n'
         f'<header class="webpublish-header">\n'
-        f'  <div class="webpublish-header-title">{avatar_img}<h1>{escape(room_name)}</h1></div>\n{topic_p}'
-        f'{banner_block}\n'
+        f'  <div class="webpublish-header-title">{avatar_img}<h1>{escape(room_name)}</h1></div>\n{topic_p}\n'
+        f'  <div class="webpublish-header-actions">\n  {actions_inner}\n  </div>\n'
         f'</header>\n'
         f'<main class="webpublish-chat">\n'
         f'  <div class="webpublish-messages" id="messages">\n{msgs_html}\n  </div>\n'
