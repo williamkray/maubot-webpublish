@@ -112,7 +112,7 @@ Always add `self.log.debug(f"...: {e}")` in the except clause so failures are vi
 
 `@web.*` decorated methods are registered via `dir()` (alphabetical by method name). Dynamic routes like `/{alias}` shadow literal routes registered later alphabetically — put specific routes on methods that sort *before* the catch-all, or use a regex pattern like `/{alias:[^/]+}` to prevent empty-alias matches.
 
-Reserved alias names (checked in `seturi`, set as `RESERVED_ALIASES` in `bot.py`): `media`, `tiles`, `theme`, `tag`, `tags`, `post`, `sse`, `feed.xml`, `thread`. Any URI that would collide with a literal route segment belongs here.
+Reserved alias names (checked in `setpath`, set as `RESERVED_ALIASES` in `bot.py`): `media`, `tiles`, `theme`, `tag`, `tags`, `post`, `sse`, `feed.xml`, `thread`. Any URI that would collide with a literal route segment belongs here.
 
 ### Maubot trailing-slash invariant
 

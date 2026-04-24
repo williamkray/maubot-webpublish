@@ -180,6 +180,7 @@ class WebPublishBot(Plugin):
                 self._alias_to_room.pop(default_alias, None)
                 self._redirect_aliases.pop(default_alias, None)
         self._pinned_events.pop(room_id, None)
+        self._room_avatars.pop(room_id, None)
         await self.database.execute(
             "DELETE FROM published_rooms WHERE room_id = $1", room_id
         )
@@ -887,35 +888,46 @@ class WebPublishBot(Plugin):
         url = f"{self._base_url}/" if alias == "/" else f"{self._base_url}/{alias}"
         await evt.reply(f"Published ({info['mode']} mode): {url}")
 
-    @webpublish.subcommand("seturi", help="Override the URI path for this room's published site")
-    @command.argument("uri", pass_raw=True)
-    async def seturi(self, evt: MessageEvent, uri: str) -> None:
+    @webpublish.subcommand("setpath", aliases=["seturi"], help="Override the URL path for this room's published site (omit argument or pass \"\" to revert to default)")
+    @command.argument("path", pass_raw=True, required=False)
+    async def setpath(self, evt: MessageEvent, path: str) -> None:
         if not await self._check_power_level(evt):
             return
         info = self._published.get(evt.room_id)
         if not info:
             await evt.reply("This room is not published. Use `!webpublish chat` or `!webpublish journal` first.")
             return
-        uri = uri.strip()
-        if uri == "/":
+        path = (path or "").strip()
+        if path in ("''", '""'):
+            path = ""
+        if path == "":
+            default_alias = info.get("default_alias") or info["alias"]
+            if info["alias"] == default_alias:
+                await evt.reply("No custom path override is set for this room.")
+                return
+            await self._set_published(evt.room_id, info["mode"], default_alias)
+            url = f"{self._base_url}/" if default_alias == "/" else f"{self._base_url}/{default_alias}"
+            await evt.reply(f"Path override removed. Site now available at {url}")
+            return
+        if path == "/":
             alias = "/"
         else:
-            alias = uri.strip("/")
+            alias = path.strip("/")
             if not re.match(r'^[a-zA-Z0-9_\-]+$', alias):
-                await evt.reply("Invalid URI. Use only letters, numbers, hyphens, and underscores.")
+                await evt.reply("Invalid path. Use only letters, numbers, hyphens, and underscores.")
                 return
             if alias in RESERVED_ALIASES:
                 await evt.reply(
-                    f"`{alias}` is reserved for internal routes. Choose a different URI."
+                    f"`{alias}` is reserved for internal routes. Choose a different path."
                 )
                 return
         existing_owner = self._alias_to_room.get(alias)
         if existing_owner and existing_owner != evt.room_id:
-            await evt.reply("That URI is already in use by another room.")
+            await evt.reply("That path is already in use by another room.")
             return
         await self._set_published(evt.room_id, info["mode"], alias)
         url = f"{self._base_url}/" if alias == "/" else f"{self._base_url}/{alias}"
-        await evt.reply(f"URI updated! Site now available at {url}")
+        await evt.reply(f"Path updated! Site now available at {url}")
 
     @webpublish.subcommand("config", help="Set or view per-room config overrides")
     @command.argument("args", pass_raw=True, required=False)
@@ -1734,6 +1746,18 @@ class WebPublishBot(Plugin):
         payload = await self._build_pinned_payload(evt.room_id, info.get("mode"))
         if payload is not None:
             self._notify_sse(evt.room_id, "pinned_changed", payload)
+
+    @event.on(EventType.find("m.room.avatar", t_class=EventType.Class.STATE))
+    async def handle_room_avatar_state(self, evt) -> None:
+        if evt.room_id not in self._published:
+            return
+        if getattr(evt, "state_key", "") != "":
+            return
+        content = evt.content
+        if hasattr(content, "serialize"):
+            content = content.serialize()
+        url = content.get("url", "") if isinstance(content, dict) else ""
+        self._room_avatars[evt.room_id] = url if isinstance(url, str) else ""
 
     # ------------------------------------------------------------------
     # Web handlers
