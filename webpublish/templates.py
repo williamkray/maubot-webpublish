@@ -296,6 +296,48 @@ def render_body(msg: dict, homeserver_url: str, proxy_base_url: str = "", journa
                 return linked
         return f"[image: {alt}]"
 
+    if msgtype == "m.video":
+        url = mxc_to_http(msg.get("media_url", ""), homeserver_url, proxy_base_url)
+        body_text = msg.get("body", "")
+        alt = escape(body_text or "video")
+        is_filename = bool(re.fullmatch(r'[^\s]+\.[a-zA-Z0-9]{2,5}', body_text or ""))
+        if url:
+            video = (
+                f'<video class="webpublish-media" src="{escape(url)}"'
+                f' controls preload="metadata"></video>'
+            )
+            if journal:
+                formatted = msg.get("formatted_body")
+                if formatted:
+                    text_block = f'<div class="webpublish-image-body">{sanitize_html(formatted, homeserver_url, proxy_base_url)}</div>'
+                elif not is_filename:
+                    text_block = f'<div class="webpublish-image-body">{linkify_plaintext(body_text)}</div>'
+                else:
+                    text_block = ""
+                figure = f'<figure class="webpublish-figure webpublish-figure-full">{video}</figure>'
+                return figure + ("\n" + text_block if text_block else "")
+            caption = "" if is_filename else escape(body_text)
+            if caption:
+                return f'<figure class="webpublish-figure">{video}<figcaption>{caption}</figcaption></figure>'
+            return video
+        return f"[video: {alt}]"
+
+    if msgtype == "m.audio":
+        url = mxc_to_http(msg.get("media_url", ""), homeserver_url, proxy_base_url)
+        body_text = msg.get("body", "")
+        alt = escape(body_text or "audio")
+        is_filename = bool(re.fullmatch(r'[^\s]+\.[a-zA-Z0-9]{2,5}', body_text or ""))
+        if url:
+            audio = (
+                f'<audio class="webpublish-media" src="{escape(url)}"'
+                f' controls preload="metadata"></audio>'
+            )
+            caption = "" if is_filename else escape(body_text)
+            if caption:
+                return f'<figure class="webpublish-figure">{audio}<figcaption>{caption}</figcaption></figure>'
+            return audio
+        return f"[audio: {alt}]"
+
     if msgtype == "m.file":
         url = mxc_to_http(msg.get("media_url", ""), homeserver_url, proxy_base_url)
         name = escape(msg.get("body", "file"))
@@ -761,6 +803,13 @@ body.webpublish-chat-mode .webpublish-header { flex: 0 0 auto; }
 .webpublish-body img.webpublish-media {
   max-width: 400px; max-height: 300px; border-radius: 8px; margin: 4px 0;
 }
+.webpublish-body video.webpublish-media {
+  max-width: 100%; max-height: 60vh; width: auto; height: auto;
+  display: block; border-radius: 8px; margin: 4px 0;
+}
+.webpublish-body audio.webpublish-media {
+  max-width: 100%; display: block; margin: 4px 0;
+}
 img.webpublish-custom-emoji {
   height: 1.4em; width: auto; vertical-align: middle; display: inline-block;
 }
@@ -879,6 +928,10 @@ body.webpublish-chat-mode .webpublish-pinned-list {
 /* full-width image figures in journal post detail */
 .webpublish-figure-full { display: block; margin: 0 0 4px; }
 .webpublish-figure-full img.webpublish-media { max-width: 100%; max-height: none; border-radius: 8px; }
+.webpublish-figure-full video.webpublish-media {
+  max-width: 100%; max-height: 60vh; width: auto; height: auto;
+  display: block; margin: 0 auto; border-radius: 8px;
+}
 .webpublish-image-body { margin-top: 12px; line-height: 1.7; }
 
 .webpublish-comments { margin-top: 32px; border-top: 1px solid var(--border); padding-top: 24px; }
