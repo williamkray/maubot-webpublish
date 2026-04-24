@@ -201,6 +201,25 @@ without having the bot redact their messages. defaults to `true`.
 `base_url`: the full base url of this plugin's web endpoint. leave empty to auto-detect from maubot. only needed if
 your maubot instance is behind a reverse proxy with a different public url.
 
+# Advanced Maubot Configuration
+
+Running this maubot standalone is one way to get it to have a nice clean URL, but here are some alternative tips:
+
+In your `maubot` config (not the plugin config!) you can set `plugin_base_path` to adjust the prefix of the sites
+hosted by the plugin. For example, if your maubot public url is `https://maubot.example.com` you could set a
+`plugin_base_path: /` to ensure that all plugin sites are hosted at the top domain.
+
+Then, name your plugin instance something that you'd want to prefix all sites served by the plugin, like `blog` or
+`p`. This respectively means all rooms you publish would be linked as
+`https://maubot.example.com/blog/<yourroom>` or `https://maubot.example.com/p/<yourroom>`.
+
+If you have a reverse proxy that handles rewriting URLs you can set rewrite rules to change the domain you're using
+altogether. For example, if our maubot is running at https://maubot.example.com but we want sites to be served from
+https://www.mywebsite.com, we can set the rewrite rule in the reverse proxy, configure the plugin to use
+https://www.mywebsite.com as the `base_url`, and then all links will point properly.
+
+If you need more instruction than that, this might not be the tool for you!
+
 # scaling
 
 for larger deployments (many rooms, many concurrent readers, high-traffic pages) see [SCALING.md](SCALING.md) —
