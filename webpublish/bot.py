@@ -1101,14 +1101,15 @@ class WebPublishBot(Plugin):
                             ))
                         continue
 
-                    if raw.get("type") != "m.room.message":
+                    raw_type = raw.get("type")
+                    if raw_type not in ("m.room.message", "m.sticker"):
                         continue
                     if raw.get("unsigned", {}).get("redacted_because"):
                         continue
                     c = raw.get("content", {})
                     relates = c.get("m.relates_to") or {}
 
-                    if relates.get("rel_type") == "m.replace":
+                    if raw_type == "m.room.message" and relates.get("rel_type") == "m.replace":
                         target_event_id = relates.get("event_id", "")
                         if target_event_id and target_event_id not in pending_edits:
                             new_content = c.get("m.new_content") or {}
@@ -1122,7 +1123,7 @@ class WebPublishBot(Plugin):
                     if sender == self.client.mxid:
                         continue
                     body = c.get("body", "")
-                    if body.startswith("!webpublish"):
+                    if raw_type == "m.room.message" and body.startswith("!webpublish"):
                         continue
 
                     thread_root = None
@@ -1137,14 +1138,22 @@ class WebPublishBot(Plugin):
 
                     sender_name = await self._get_sender_name(room_id, sender)
                     sender_avatar = self._avatar_urls.get(sender, "") or None
-                    backfill_msgtype = c.get("msgtype", "m.text")
+                    if raw_type == "m.sticker":
+                        backfill_msgtype = "m.sticker"
+                    else:
+                        backfill_msgtype = c.get("msgtype", "m.text")
                     backfill_geo_uri = None
                     if backfill_msgtype == "m.location":
                         backfill_geo_uri = (
                             (c.get("org.matrix.msc3488.location") or {}).get("uri")
                             or c.get("geo_uri")
                         )
-                    backfill_published = not (is_journal_emoji and thread_root is None)
+                    if backfill_msgtype == "m.sticker":
+                        backfill_published = not (
+                            info.get("mode") == "journal" and thread_root is None
+                        )
+                    else:
+                        backfill_published = not (is_journal_emoji and thread_root is None)
                     await self._store_message(
                         room_id=room_id,
                         event_id=raw["event_id"],
@@ -1414,6 +1423,121 @@ class WebPublishBot(Plugin):
         else:  # journal
             if thread_root:
                 html = render_message_html(msg_dict, hs, base, show_reply_header=bool(reply_to))
+                self._notify_sse(evt.room_id, "new_message", {
+                    "html": html, "is_thread": True,
+                    "thread_root": thread_root,
+                    "event_id": str(evt.event_id),
+                })
+            elif published:
+                msg_dict["tags"] = parse_hashtags(body)
+                html = render_post_preview_html(msg_dict, info["alias"], 0)
+                self._notify_sse(evt.room_id, "new_message", {
+                    "html": html, "is_thread": False,
+                    "event_id": str(evt.event_id),
+                })
+
+    @event.on(EventType.STICKER)
+    async def handle_sticker(self, evt: MessageEvent) -> None:
+        if evt.room_id not in self._published:
+            return
+
+        content = evt.content
+        body = content.body or ""
+        media_url = str(content.url) if getattr(content, "url", None) else None
+
+        relates = content.relates_to
+        thread_root = None
+        reply_to = None
+        if relates:
+            rt = getattr(relates, "rel_type", None)
+            rel_type = rt.value if hasattr(rt, "value") else str(rt or "")
+            if rel_type == "m.thread":
+                thread_root = str(relates.event_id)
+            if not relates.is_falling_back:
+                irt = getattr(relates, "in_reply_to", None)
+                if irt:
+                    irt_id = getattr(irt, "event_id", None)
+                    reply_to = str(irt_id) if irt_id else None
+
+        info = self._published[evt.room_id]
+        sender_name = await self._get_sender_name(evt.room_id, str(evt.sender))
+        sender_avatar = self._avatar_urls.get(str(evt.sender), "") or None
+
+        # Stickers never auto-publish as top-level journal posts; they can
+        # only become visible via a privileged 📰 reaction, which itself
+        # requires journal_emoji_publish to be on.
+        published = not (info["mode"] == "journal" and thread_root is None)
+
+        await self._store_message(
+            room_id=evt.room_id,
+            event_id=str(evt.event_id),
+            sender=str(evt.sender),
+            sender_name=sender_name,
+            body=body,
+            formatted_body=None,
+            msgtype="m.sticker",
+            media_url=media_url,
+            timestamp=evt.timestamp,
+            thread_root=thread_root,
+            reply_to=reply_to,
+            geo_uri=None,
+            published=published,
+            avatar_url=sender_avatar,
+        )
+        if info["mode"] == "journal" and thread_root is None:
+            await self._store_tags(str(evt.event_id), evt.room_id, body)
+
+        hs = self._homeserver_url()
+        msg_dict = {
+            "event_id": str(evt.event_id),
+            "room_id": evt.room_id,
+            "sender": str(evt.sender),
+            "sender_name": sender_name,
+            "body": body,
+            "formatted_body": None,
+            "msgtype": "m.sticker",
+            "media_url": media_url,
+            "timestamp": evt.timestamp,
+            "thread_root": thread_root,
+            "reply_to": reply_to,
+            "geo_uri": None,
+            "edited": False,
+            "redacted": False,
+            "avatar_url": sender_avatar,
+        }
+        await self._enrich_single_reply(msg_dict)
+
+        base = self._base_url
+        if info["mode"] == "chat":
+            if thread_root:
+                count_map = await self._get_comment_counts([thread_root])
+                count = count_map.get(thread_root, 0)
+                parts_map = await self._get_thread_participants([thread_root], 6)
+                indicator_html = render_thread_indicator_html(
+                    thread_root, count, parts_map.get(thread_root, []), hs, base,
+                )
+                reply_html = render_message_html(
+                    msg_dict, hs, base, show_reply_header=bool(reply_to),
+                )
+                self._notify_sse(evt.room_id, "thread_reply", {
+                    "thread_root": thread_root,
+                    "root_element_id": safe_element_id(thread_root),
+                    "count": count,
+                    "indicator_html": indicator_html,
+                    "reply_html": reply_html,
+                    "reply_element_id": safe_element_id(str(evt.event_id)),
+                    "event_id": str(evt.event_id),
+                })
+            else:
+                html = render_message_html(msg_dict, hs, base)
+                self._notify_sse(evt.room_id, "new_message", {
+                    "html": html, "event_id": str(evt.event_id),
+                })
+        else:  # journal
+            if thread_root:
+                html = render_message_html(
+                    msg_dict, hs, base, show_reply_header=bool(reply_to),
+                )
                 self._notify_sse(evt.room_id, "new_message", {
                     "html": html, "is_thread": True,
                     "thread_root": thread_root,

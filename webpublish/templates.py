@@ -270,6 +270,16 @@ def render_body(msg: dict, homeserver_url: str, proxy_base_url: str = "", journa
 
     msgtype = msg.get("msgtype", "m.text")
 
+    if msgtype == "m.sticker":
+        url = mxc_to_http(msg.get("media_url", ""), homeserver_url, proxy_base_url)
+        alt = escape(msg.get("body", "") or "sticker")
+        if url:
+            return (
+                f'<img class="webpublish-sticker" src="{escape(url)}"'
+                f' alt="{alt}" loading="lazy">'
+            )
+        return f"[sticker: {alt}]"
+
     if msgtype == "m.image":
         url = mxc_to_http(msg.get("media_url", ""), homeserver_url, proxy_base_url)
         body_text = msg.get("body", "")
@@ -812,6 +822,10 @@ body.webpublish-chat-mode .webpublish-header { flex: 0 0 auto; }
 }
 img.webpublish-custom-emoji {
   height: 1.4em; width: auto; vertical-align: middle; display: inline-block;
+}
+.webpublish-body img.webpublish-sticker {
+  max-width: 160px; max-height: 160px; width: auto; height: auto;
+  display: block; margin: 4px 0;
 }
 .webpublish-body.webpublish-emoji-only { font-size: 2.2em; line-height: 1.2; }
 .webpublish-body.webpublish-emoji-only img.webpublish-custom-emoji { height: 1em; }
