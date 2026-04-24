@@ -51,6 +51,21 @@ Set per-room via `!webpublish chat|journal`:
 - `reaction_removed` — a reaction was redacted. Same payload shape as `reaction_added`; `reactions_html` is empty when the last reaction is gone.
 - `post_unpublished` *(journal mode only)* — a top-level post transitioned to draft because the last privileged 📰 reaction was redacted. Payload: `element_id`, `event_id`. Landing page removes the card; post-detail page reloads (server 404s).
 - `pinned_changed` — the room's `m.room.pinned_events` state changed. Payload depends on mode: chat → `{"banner_html": <str>}` (full `<div class="webpublish-pinned-banner">…</div>` or empty string); journal → `{"html": <str>}` (full `<section class="webpublish-pinned-posts">…</section>` or empty string). Empty payload means remove the element from the DOM.
+- `succession_changed` — the room's `m.room.tombstone` state changed (forward-link to replacement room or archive marker). Payload: `{"banner_html": <str>}` (full `<div class="webpublish-succession-banner">…</div>` or empty string). Empty string means remove the banner from the DOM. `m.room.create`-derived predecessor back-links do not emit this event (they're fixed for a room's lifetime and rendered server-side from startup state). A tombstone with a non-empty `replacement_room` also kicks `_auto_migrate_to_replacement` in the background — see below.
+
+### Room-succession auto-migration
+
+When a published room's `m.room.tombstone` sets `replacement_room`, `_auto_migrate_to_replacement` tries to: (a) `POST /join/{room}` on the replacement, (b) verify access by reading `m.room.create` on it, (c) take over the old room's human alias for the new room (preferring the new room's own `m.room.canonical_alias` if present), (d) archive the old room by rewriting its `published_rooms.alias` to the room_id itself via `_archive_publication`. The old site then lives at `/{urlencoded_room_id}/`; the human alias routes to the new room.
+
+Migration is retried from three triggers, with `self._migrating: set[str]` preventing concurrent duplicates for the same old room:
+
+1. **Live tombstone** — `handle_tombstone_state` kicks `_launch_migration`.
+2. **Invite to the bot** — `handle_member_state` fires on `m.room.member` invites to the bot's mxid. It reads the inviting room's `m.room.create.predecessor` and, if that predecessor is a published room, launches migration. Covers the race where tombstone arrives before the invite is processed.
+3. **Plugin startup** — for any published room whose saved tombstone points to an unpublished replacement, `_launch_migration` runs once after `_load_published_rooms`.
+
+If all three paths fail (bot not invited, room private, join rejected), the admin can run `!webpublish chat|journal` in the new room to publish manually — tombstoned rooms are typically read-only so a migrate command there is moot. `_launch_migration` wraps `asyncio.create_task` with a done-callback that logs any exception so failures are visible in the plugin log. If the new room's `m.room.create` lacks a `predecessor` pointer, one is synthesized in memory so the "View Archive" link still appears on the new room's pages.
+
+**matrix: URI form for external targets** — When a predecessor or replacement room isn't in `_published`, the banner falls back to a matrix URI. Clients like Element resolve `matrix:r/<alias>` reliably but struggle with `matrix:roomid/<id>` unless a `via` hint is present. `_render_succession_banner_for_room` therefore passes the *current* room's human alias as a hint for the replacement target on a tombstoned-but-not-yet-migrated room — during a Matrix room upgrade the alias server typically reassigns the alias to the new room, so `matrix:r/<old_alias>` correctly opens the replacement. See `matrix_room_uri(room_id, alias)` in `templates.py`.
 
 ### Media proxy
 
@@ -74,6 +89,8 @@ Set per-room via `!webpublish chat|journal`:
 | `_backfilling` | `set[room_id]` — guards against concurrent backfills |
 | `_room_create_cache` | `room_id → (version, set[creator_mxid])` — room v12 creator check |
 | `_pinned_events` | `room_id → ordered list[event_id]` — latest `m.room.pinned_events` contents; populated on start/publish and refreshed by the state handler |
+| `_room_succession` | `room_id → {has_tombstone, replacement_room, tombstone_ts, predecessor_room}` — drives the footer banner. Populated on start/publish; tombstone side is refreshed live by `handle_tombstone_state` |
+| `_backfill_tasks` | `room_id → asyncio.Task` — tracked handles for the async backfill crawl; cancelled in `stop()`. Existence of an entry does not imply the task is mid-request (the finer-grained `_backfilling` set does that) |
 
 ### Key maubot/mautrix patterns
 
@@ -88,7 +105,7 @@ Set per-room via `!webpublish chat|journal`:
 
 `self.client.get_state_event(room_id, EventType.X)` only works reliably for event types already proven in the codebase (ROOM_NAME, ROOM_TOPIC, ROOM_MEMBER, ROOM_CANONICAL_ALIAS, ROOM_ENCRYPTION, ROOM_POWER_LEVELS, ROOM_CREATE). For any other type the EventType attribute may not exist or the deserialized content may not have the expected attributes — exceptions disappear silently.
 
-Raw-API state lookups already proven in the codebase: `m.room.avatar`, `m.room.pinned_events`, and the plugin's own `org.jobmachine.webpublish.config`.
+Raw-API state lookups already proven in the codebase: `m.room.avatar`, `m.room.pinned_events`, `m.room.tombstone`, `m.room.create`, and the plugin's own `org.jobmachine.webpublish.config`.
 
 **For any new/unfamiliar state event type, use the raw API:**
 
@@ -104,7 +121,7 @@ Always add `self.log.debug(f"...: {e}")` in the except clause so failures are vi
 
 ### Config keys (`base-config.yaml`)
 
-`css`, `pagination` (int), `max_backfill` (int), `min_power_level` (int), `base_url` (str, empty = auto-detect), `journal_author_pl` (int), `journal_emoji_publish` (bool), `journal_enforce_messages` (bool), `chat_author_pl` (int), `chat_enforce_messages` (bool).
+`css`, `pagination` (int), `max_backfill` (int — `<= 0` means unlimited resumable crawl), `backfill_batch_size` (int, clamped to `[1, 1000]`, default 50), `min_power_level` (int), `base_url` (str, empty = auto-detect), `journal_author_pl` (int), `journal_emoji_publish` (bool), `journal_enforce_messages` (bool), `chat_author_pl` (int), `chat_enforce_messages` (bool).
 
 `chat_enforce_messages` mirrors `journal_enforce_messages`: when true, top-level chat messages from users below `chat_author_pl` are redacted (threaded replies bypass). Enforcement is live-only — backfill does not retroactively redact, matching the journal precedent.
 
@@ -129,7 +146,19 @@ Any logic applied in `handle_message()` (the live event handler) **must be mirro
 Known parity points to keep in sync:
 - `published` flag: computed from `mode`, `thread_root`, and `journal_emoji_publish` config
 - `avatar_url`: fetched from `_avatar_urls` cache (populated by `_get_sender_name()`)
-- Reaction storage and 📰 publish gate: `handle_reaction()` (live) vs. `pending_reactions` post-loop pass in `_backfill_room()`. Both paths must (a) persist every `m.reaction` via `_store_reaction()` and (b) run the 📰-publish gate for top-level journal posts when `journal_emoji_publish` is true.
+- Reaction storage and 📰 publish gate: `handle_reaction()` (live) vs. the *per-batch* `pending_reactions` pass inside the `_backfill_room_inner` loop. Both paths must (a) persist every `m.reaction` via `_store_reaction()` and (b) run the 📰-publish gate for top-level journal posts when `journal_emoji_publish` is true. Pending reactions/edits are flushed at the end of each batch (not once per crawl) so memory stays bounded during an unlimited crawl.
+
+### Resumable backfill
+
+`_backfill_room_inner()` supports two modes, driven by the `max_backfill` config:
+- `max_backfill > 0` — bounded. Crawl stops when `total >= max_backfill` (`status='capped'`) or when the homeserver returns no `end_token` (`status='exhausted'`).
+- `max_backfill <= 0` — unlimited. Crawl continues until `status='exhausted'`, pacing with `_BACKFILL_BATCH_SLEEP` (default 1.0s) between `/messages` requests.
+
+Progress is persisted per batch in the `backfill_progress` table (`room_id`, `end_token`, `status`, `total`, `updated_at`). On plugin start, `_resume_backfills()` re-launches any room whose status is `'running'`. `!webpublish rebuild` deletes the checkpoint + all stored messages before kicking a fresh crawl. Re-fetching an event is idempotent (messages use `INSERT ... ON CONFLICT DO NOTHING`).
+
+First-time backfill of a room with pre-existing live-stored events seeds the pagination token via `/rooms/{id}/context/{oldest_event_id}` so the crawler skips past what we already have. Failure falls back to starting at the live edge.
+
+Background crawl tasks are tracked in `self._backfill_tasks` and cancelled in `stop()`; the `CancelledError` path saves a `'running'` checkpoint so the crawl picks up where it left off on next start.
 
 ### Adding a message field — checklist
 
@@ -143,6 +172,26 @@ When adding a column to the `messages` table:
 6. If the field affects the SSE live-update payload, update the `msg_dict` built after `_store_message()` in `handle_message()`
 
 Reactions are stored in a separate `reactions` table, not on `messages`. Hydrate them onto message dicts via `_apply_reactions_to_messages(room_id, messages)` *after* `_enrich_reply_context` and *before* calling a render function. That helper also strips 📰 from top-level journal posts when `journal_emoji_publish` is enabled.
+
+### Rendering conventions — check these before writing new UI code
+
+**URL construction for published-room links.** No trailing slashes except the root. Pattern:
+
+```python
+url = f"{base_url}/" if alias == "/" else f"{base_url}/{quote(alias, safe='')}"
+```
+
+`@web.get("/{alias}")` does not match a trailing slash. `base_url/foo/` 404s; `base_url/foo` works. The root alias (`"/"`) is the one exception — maubot's plugin-prefix check requires the trailing `/`.
+
+**Matrix URI construction.** Never hand-roll. Use `matrix_room_uri(room_id, alias="", homeserver_url="")` and `matrix_event_uri(room_id, event_id, homeserver_url="")` in `templates.py`. They enforce: prefer `matrix:r/<alias>` when an alias is known (widely supported by clients); fall back to `matrix:roomid/<id>?via=<bot_homeserver>`. Derive `via` from **the bot's homeserver hostname** (`urlparse(self._homeserver_url()).hostname`), not from the room id's server part — room v12 ids have no server part and an id-derived `via` wouldn't be a homeserver that actually federates the room anyway. Sigil-to-prefix lookups for body-rendering use `_MXID_SIGIL_TO_MATRIX_PREFIX`.
+
+**Footer/chrome styling baseline.** Match `.webpublish-feed-footer`: `font-size: 0.85rem`, `color: var(--text-muted)`, minimal padding (`6px 0`), no top border, links hover to `var(--accent)`. If a footer needs left/right split, use flex with `justify-content: space-between` + inner `.webpublish-<name>-left` / `-right` wrappers; each group `display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap`.
+
+**Sticky-footer layout.** `body` is already `display: flex; flex-direction: column; min-height: 100dvh`. Any main container that should push its footer to the viewport bottom needs `flex: 1 0 auto; width: 100%` — see `.webpublish-journal` and `.webpublish-post-full`. Chat mode uses `height: 100dvh; overflow: hidden` and a fixed-height flex column instead.
+
+**Scoping a rendered UI element.** Before wiring a helper into `render_chat_page` / `render_journal_landing` / `render_journal_post`, decide per-view whether it applies. Post-detail is the individual article; the landing page is the list. A room-scoped footer (succession banner, pinned section) usually belongs on the list and chat-full-view — **not** the post detail. If unsure, ask the user before threading the parameter through multiple signatures and SSE scripts.
+
+**Adding an SSE-emitted UI element.** When the element can change live, add a `<name>_changed` event to the event-type list above, emit the full re-rendered HTML as `banner_html`/`html` in the payload, and register a handler in *each* SSE script that hosts the element (`_sse_chat_script`, `_sse_journal_landing_script`, `_sse_post_detail_script`). Empty string payload means remove the DOM node. Don't add the handler to a script whose page doesn't render the element.
 
 ### Feature request files
 

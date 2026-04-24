@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from collections import OrderedDict
 from typing import Any, Callable, Type
 from urllib.parse import unquote
@@ -27,6 +28,7 @@ from .templates import (
     render_pinned_section_html,
     render_post_preview_html,
     render_reactions_html,
+    render_succession_banner,
     render_tag_filter_page,
     render_tag_index_page,
     render_thread_indicator_html,
@@ -69,6 +71,7 @@ OVERRIDABLE_CONFIG: dict[str, Callable[[str], Any]] = {
     "css": str,
     "pagination": int,
     "max_backfill": int,
+    "backfill_batch_size": int,
     "min_power_level": int,
     "journal_author_pl": int,
     "journal_emoji_publish": _parse_bool,
@@ -83,6 +86,7 @@ class Config(BaseProxyConfig):
         helper.copy("css")
         helper.copy("pagination")
         helper.copy("max_backfill")
+        helper.copy("backfill_batch_size")
         helper.copy("base_url")
         helper.copy("min_power_level")
         helper.copy("journal_author_pl")
@@ -112,6 +116,7 @@ class WebPublishBot(Plugin):
         self._avatar_urls: dict[str, str] = {}
         self._room_avatars: dict[str, str] = {}
         self._backfilling: set[str] = set()
+        self._backfill_tasks: dict[str, asyncio.Task] = {}
         # Cap simultaneous room backfills so rebuilding several rooms at once
         # doesn't saturate the homeserver pagination endpoint or the DB pool.
         self._backfill_semaphore: asyncio.Semaphore = asyncio.Semaphore(2)
@@ -122,9 +127,35 @@ class WebPublishBot(Plugin):
         self._room_create_cache: dict[str, tuple[int, set[str]]] = {}
         self._room_config_overrides: dict[str, dict[str, Any]] = {}
         self._pinned_events: dict[str, list[str]] = {}  # room_id -> ordered pinned event_ids
+        # Room-succession state for tombstone / predecessor banners.
+        # room_id -> {
+        #   "has_tombstone": bool,
+        #   "replacement_room": str,      # "" == dead-end; non-empty == forward link
+        #   "tombstone_ts": int | None,
+        #   "predecessor_room": str | None,
+        # }
+        self._room_succession: dict[str, dict] = {}
+        # Guards concurrent auto-migration calls for the same old room. A race
+        # is possible because both the tombstone handler and the invite
+        # handler kick migration for the same pair.
+        self._migrating: set[str] = set()
         await self._load_published_rooms()
         for rid in list(self._published.keys()):
             self._pinned_events[rid] = await self._get_pinned_events(rid)
+            self._room_succession[rid] = await self._fetch_room_succession(rid)
+        await self._resume_backfills()
+        # Attempt migration for any published room that was already tombstoned
+        # when we booted. Runs in the background so startup isn't blocked on
+        # join/fetch round-trips.
+        for rid in list(self._published.keys()):
+            succession = self._room_succession.get(rid) or {}
+            replacement = succession.get("replacement_room") or ""
+            if replacement and replacement not in self._published:
+                self.log.info(
+                    f"Startup: published room {rid} is tombstoned -> {replacement}; "
+                    f"scheduling migration"
+                )
+                self._launch_migration(rid, replacement)
 
     async def stop(self) -> None:
         for queues in self._sse_queues.values():
@@ -134,6 +165,39 @@ class WebPublishBot(Plugin):
                 except asyncio.QueueFull:
                     pass
         self._sse_queues.clear()
+        tasks = list(self._backfill_tasks.values())
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._backfill_tasks.clear()
+
+    def _launch_backfill(self, room_id: str) -> None:
+        """Spawn a tracked backfill task. Safe to call repeatedly; the inner
+        guard (`_backfilling`) prevents duplicate work if one is already running."""
+        existing = self._backfill_tasks.get(room_id)
+        if existing and not existing.done():
+            return
+        task = asyncio.create_task(self._backfill_room(room_id))
+        self._backfill_tasks[room_id] = task
+
+        def _cleanup(t: asyncio.Task, rid: str = room_id) -> None:
+            # Only pop if the slot still holds this task (avoids racing with a
+            # re-launch that replaced the entry).
+            if self._backfill_tasks.get(rid) is t:
+                self._backfill_tasks.pop(rid, None)
+
+        task.add_done_callback(_cleanup)
+
+    async def _resume_backfills(self) -> None:
+        rows = await self.database.fetch(
+            "SELECT room_id, status FROM backfill_progress WHERE status='running'"
+        )
+        for row in rows:
+            rid = row["room_id"]
+            if rid in self._published:
+                self.log.info(f"Resuming in-progress backfill for {rid}")
+                self._launch_backfill(rid)
 
     # ------------------------------------------------------------------
     # Database helpers
@@ -152,6 +216,30 @@ class WebPublishBot(Plugin):
                 self._alias_to_room[default_alias] = rid
                 self._redirect_aliases[default_alias] = alias
             self._room_config_overrides[rid] = await self._fetch_room_overrides(rid)
+
+    async def _archive_publication(self, room_id: str, archived_alias: str) -> None:
+        """Rewrite a published row to a room-id-based alias so the human alias
+        it previously held is free for a replacement room to claim. Clears any
+        setpath-style `default_alias` redirect; the archive URL is canonical."""
+        info = self._published.get(room_id)
+        if not info:
+            return
+        old_alias = info["alias"]
+        old_default = info.get("default_alias") or old_alias
+        self._alias_to_room.pop(old_alias, None)
+        if old_default != old_alias:
+            self._alias_to_room.pop(old_default, None)
+        self._redirect_aliases.pop(old_default, None)
+        await self.database.execute(
+            "UPDATE published_rooms SET alias=$1, default_alias=$1 WHERE room_id=$2",
+            archived_alias, room_id,
+        )
+        self._published[room_id] = {
+            "mode": info["mode"],
+            "alias": archived_alias,
+            "default_alias": archived_alias,
+        }
+        self._alias_to_room[archived_alias] = room_id
 
     async def _set_published(self, room_id: str, mode: str, alias: str) -> None:
         old = self._published.get(room_id)
@@ -181,6 +269,7 @@ class WebPublishBot(Plugin):
                 self._redirect_aliases.pop(default_alias, None)
         self._pinned_events.pop(room_id, None)
         self._room_avatars.pop(room_id, None)
+        self._room_succession.pop(room_id, None)
         await self.database.execute(
             "DELETE FROM published_rooms WHERE room_id = $1", room_id
         )
@@ -597,6 +686,230 @@ class WebPublishBot(Plugin):
             self.log.debug(f"Could not fetch pinned events for {room_id}: {e}")
             return []
 
+    def _launch_migration(self, old_room_id: str, replacement_room_id: str) -> None:
+        """Fire-and-forget wrapper so asyncio.create_task exceptions don't get
+        silently swallowed."""
+        task = asyncio.create_task(
+            self._auto_migrate_to_replacement(old_room_id, replacement_room_id)
+        )
+
+        def _log_errors(t: asyncio.Task) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc:
+                self.log.error(
+                    f"Migrate: background task {old_room_id} -> {replacement_room_id} "
+                    f"raised {exc!r}",
+                    exc_info=exc,
+                )
+
+        task.add_done_callback(_log_errors)
+
+    async def _auto_migrate_to_replacement(
+        self, old_room_id: str, replacement_room_id: str,
+    ) -> bool:
+        """Follow an `m.room.tombstone` forward link: join the replacement,
+        take over the old room's alias for it, and archive the old publication
+        under a room-id-based URL. Returns True iff the migration completed.
+
+        Safe to call repeatedly — short-circuits if the replacement is already
+        published, and a per-old-room guard prevents concurrent duplicates."""
+        if old_room_id not in self._published:
+            self.log.debug(f"Migrate: old {old_room_id} not published, skipping")
+            return False
+        if not isinstance(replacement_room_id, str) or not replacement_room_id.startswith("!"):
+            self.log.debug(f"Migrate: invalid replacement {replacement_room_id!r}")
+            return False
+        if replacement_room_id == old_room_id:
+            return False
+        if replacement_room_id in self._published:
+            self.log.info(
+                f"Migrate: {replacement_room_id} already published; no-op"
+            )
+            return False
+        if old_room_id in self._migrating:
+            self.log.debug(f"Migrate: {old_room_id} already migrating, skipping")
+            return False
+
+        self._migrating.add(old_room_id)
+        try:
+            return await self._auto_migrate_to_replacement_inner(
+                old_room_id, replacement_room_id,
+            )
+        except Exception as e:
+            self.log.exception(
+                f"Migrate: unhandled error for {old_room_id} -> {replacement_room_id}: {e}"
+            )
+            return False
+        finally:
+            self._migrating.discard(old_room_id)
+
+    async def _auto_migrate_to_replacement_inner(
+        self, old_room_id: str, replacement_room_id: str,
+    ) -> bool:
+        old_info = self._published[old_room_id]
+        mode = old_info["mode"]
+        preserved_alias = old_info["alias"]
+        self.log.info(
+            f"Migrate: start {old_room_id} -> {replacement_room_id} "
+            f"(mode={mode}, preserved_alias={preserved_alias!r})"
+        )
+
+        # Attempt join. /join accepts a pending invite if one exists; fails
+        # otherwise. Errors here aren't fatal — we verify access next.
+        try:
+            await self.client.api.request(
+                Method.POST,
+                Path.v3.join[replacement_room_id],
+                content={},
+            )
+            self.log.info(f"Migrate: joined {replacement_room_id}")
+        except Exception as e:
+            self.log.info(
+                f"Migrate: /join {replacement_room_id} errored (may already be "
+                f"joined; verifying): {e!r}"
+            )
+
+        # Verify visibility. Fetching m.room.create is the cheapest read a
+        # joined member can do; if it fails, bot can't see the room.
+        try:
+            await self.client.api.request(
+                Method.GET,
+                Path.v3.rooms[replacement_room_id].state["m.room.create"],
+            )
+        except Exception as e:
+            self.log.warning(
+                f"Migrate: no access to {replacement_room_id} (from "
+                f"{old_room_id}): {e!r}. Bot needs an invite. Will retry on "
+                f"the next invite / restart. Manual: `!webpublish migrate` in "
+                f"the old room once the bot is invited."
+            )
+            return False
+        self.log.debug(f"Migrate: {replacement_room_id} accessible")
+
+        # Prefer the replacement's own canonical alias; else reuse the old
+        # alias (typically the upgrade reassigns the alias to the new room).
+        new_alias = preserved_alias
+        try:
+            ca = await self.client.api.request(
+                Method.GET,
+                Path.v3.rooms[replacement_room_id].state["m.room.canonical_alias"],
+            )
+            if isinstance(ca, dict):
+                a = ca.get("alias")
+                if isinstance(a, str) and a.startswith("#"):
+                    new_alias = a.lstrip("#")
+                    self.log.info(
+                        f"Migrate: new room's canonical alias is {a}, using {new_alias!r}"
+                    )
+        except Exception as e:
+            self.log.debug(
+                f"Migrate: no canonical alias on {replacement_room_id}; "
+                f"keeping preserved={preserved_alias!r}: {e!r}"
+            )
+
+        # Alias collision with another published room (edge case): fall back
+        # to room-id URL so we don't silently overwrite.
+        colliding = self._alias_to_room.get(new_alias)
+        if colliding and colliding != old_room_id and colliding != replacement_room_id:
+            self.log.warning(
+                f"Migrate: alias {new_alias!r} is claimed by {colliding}; "
+                f"using the replacement's room id as its URL instead"
+            )
+            new_alias = replacement_room_id
+
+        await self._archive_publication(old_room_id, old_room_id)
+        self.log.info(f"Migrate: archived {old_room_id} -> /{old_room_id}/")
+        await self._set_published(replacement_room_id, mode, new_alias)
+        try:
+            self._room_config_overrides[replacement_room_id] = await self._fetch_room_overrides(replacement_room_id)
+        except Exception as e:
+            self.log.debug(f"Migrate: overrides fetch failed: {e!r}")
+            self._room_config_overrides[replacement_room_id] = {}
+        self._pinned_events[replacement_room_id] = await self._get_pinned_events(replacement_room_id)
+
+        new_succession = await self._fetch_room_succession(replacement_room_id)
+        if not new_succession.get("predecessor_room"):
+            new_succession["predecessor_room"] = old_room_id
+        self._room_succession[replacement_room_id] = new_succession
+
+        self.log.info(
+            f"Migrate: complete. {old_room_id} archived; "
+            f"{replacement_room_id} now serves /{new_alias}/"
+        )
+        # Refresh the OLD room's banner so open tabs update the "View Current
+        # Content" link from matrix: URI to the internal path.
+        old_banner = self._render_succession_banner_for_room(old_room_id)
+        self._notify_sse(old_room_id, "succession_changed", {"banner_html": old_banner})
+
+        self._launch_backfill(replacement_room_id)
+        return True
+
+    def _render_succession_banner_for_room(self, room_id: str) -> str:
+        succession = self._room_succession.get(room_id)
+        if not succession:
+            return ""
+        rooms_map = {
+            rid: {"alias": info.get("alias", "")}
+            for rid, info in self._published.items()
+        }
+        # Alias hints for external (unpublished) targets. When the replacement
+        # room isn't yet published AND this room's stored alias is a human
+        # alias (not an archived room-id), we pass the human alias through as
+        # a hint — the Matrix alias server typically moves the alias to the
+        # new room during an upgrade, so `matrix:r/<old_alias>` resolves to
+        # the replacement. Better than a bare `matrix:roomid/...` which most
+        # clients won't open without via hints.
+        hints: dict[str, str] = {}
+        my_info = self._published.get(room_id) or {}
+        my_alias = my_info.get("alias", "")
+        my_alias_is_human = my_alias and not my_alias.startswith("!")
+        repl = succession.get("replacement_room") or ""
+        if repl and repl not in self._published and my_alias_is_human:
+            hints[repl] = my_alias
+        return render_succession_banner(
+            succession, rooms_map, self._base_url or "", hints,
+            homeserver_url=self._homeserver_url(),
+        )
+
+    async def _fetch_room_succession(self, room_id: str) -> dict:
+        """Look up m.room.tombstone and m.room.create to drive the footer
+        banner. Called on plugin start and after a room is published. The
+        live `handle_tombstone_state` handler refreshes this on state changes
+        and is responsible for capturing `tombstone_ts`."""
+        result = {
+            "has_tombstone": False,
+            "replacement_room": "",
+            "tombstone_ts": None,
+            "predecessor_room": None,
+        }
+        try:
+            tomb = await self.client.api.request(
+                Method.GET,
+                Path.v3.rooms[room_id].state["m.room.tombstone"],
+            )
+            if isinstance(tomb, dict):
+                result["has_tombstone"] = True
+                repl = tomb.get("replacement_room", "")
+                result["replacement_room"] = repl if isinstance(repl, str) else ""
+        except Exception as e:
+            self.log.debug(f"No tombstone for {room_id}: {e}")
+        try:
+            create = await self.client.api.request(
+                Method.GET,
+                Path.v3.rooms[room_id].state["m.room.create"],
+            )
+            if isinstance(create, dict):
+                predecessor = create.get("predecessor") or {}
+                if isinstance(predecessor, dict):
+                    pred_rid = predecessor.get("room_id")
+                    if isinstance(pred_rid, str) and pred_rid:
+                        result["predecessor_room"] = pred_rid
+        except Exception as e:
+            self.log.debug(f"Could not fetch m.room.create for {room_id}: {e}")
+        return result
+
     async def _hydrate_pinned_messages(self, room_id: str) -> list[dict]:
         """Return DB rows for pinned event_ids that exist locally and are
         non-redacted, preserving pin order. Missing ids are skipped."""
@@ -865,8 +1178,9 @@ class WebPublishBot(Plugin):
             await evt.reply("A backfill is already in progress for this room.")
             return
         await self.database.execute("DELETE FROM messages WHERE room_id = $1", evt.room_id)
+        await self._clear_backfill_progress(evt.room_id)
         await evt.reply("Message history cleared. Rebuilding from scratch…")
-        asyncio.create_task(self._backfill_room(evt.room_id))
+        self._launch_backfill(evt.room_id)
 
     @webpublish.subcommand(help="Stop publishing this room")
     async def disable(self, evt: MessageEvent) -> None:
@@ -1040,16 +1354,70 @@ class WebPublishBot(Plugin):
 
         await self._set_published(room_id, mode, alias_str)
         self._pinned_events[room_id] = await self._get_pinned_events(room_id)
+        self._room_succession[room_id] = await self._fetch_room_succession(room_id)
 
         url = f"{self._base_url}/" if alias_str == "/" else f"{self._base_url}/{alias_str}"
         await evt.reply(f"Room published in **{mode}** mode!\n\n{url}")
 
         # backfill in background
-        asyncio.create_task(self._backfill_room(room_id))
+        self._launch_backfill(room_id)
 
     # ------------------------------------------------------------------
     # Backfill
     # ------------------------------------------------------------------
+
+    # Sleep between /messages requests during a crawl. Keeps the homeserver
+    # responsive for real client traffic when a room has years of history.
+    _BACKFILL_BATCH_SLEEP: float = 1.0
+
+    async def _load_backfill_progress(self, room_id: str) -> dict | None:
+        row = await self.database.fetchrow(
+            "SELECT end_token, status, total FROM backfill_progress WHERE room_id=$1",
+            room_id,
+        )
+        if not row:
+            return None
+        return {"end_token": row["end_token"], "status": row["status"], "total": row["total"]}
+
+    async def _save_backfill_progress(
+        self, room_id: str, end_token: str | None, status: str, total: int,
+    ) -> None:
+        await self.database.execute(
+            "INSERT INTO backfill_progress (room_id, end_token, status, total, updated_at) "
+            "VALUES ($1,$2,$3,$4,$5) "
+            "ON CONFLICT (room_id) DO UPDATE SET "
+            "end_token=EXCLUDED.end_token, status=EXCLUDED.status, "
+            "total=EXCLUDED.total, updated_at=EXCLUDED.updated_at",
+            room_id, end_token, status, total, int(time.time() * 1000),
+        )
+
+    async def _clear_backfill_progress(self, room_id: str) -> None:
+        await self.database.execute(
+            "DELETE FROM backfill_progress WHERE room_id=$1", room_id,
+        )
+
+    async def _seed_backfill_token_from_context(self, room_id: str) -> str | None:
+        """If the room already has stored messages but no checkpoint, use the
+        oldest known event as a seed so we don't re-walk events handled live."""
+        oldest = await self.database.fetchval(
+            "SELECT event_id FROM messages WHERE room_id=$1 "
+            "ORDER BY timestamp ASC LIMIT 1",
+            room_id,
+        )
+        if not oldest:
+            return None
+        try:
+            content = await self.client.api.request(
+                Method.GET,
+                Path.v3.rooms[room_id].context[oldest],
+                query_params={"limit": "1"},
+            )
+        except Exception as e:
+            self.log.debug(f"Context seed failed for {room_id}/{oldest}: {e}")
+            return None
+        if isinstance(content, dict):
+            return content.get("start") or None
+        return None
 
     async def _backfill_room(self, room_id: str) -> None:
         if room_id in self._backfilling:
@@ -1063,20 +1431,45 @@ class WebPublishBot(Plugin):
 
     async def _backfill_room_inner(self, room_id: str) -> None:
         max_msgs = self._get_room_config(room_id, "max_backfill")
-        total = 0
-        end_token: str | None = None
+        try:
+            batch_size = int(self._get_room_config(room_id, "backfill_batch_size"))
+        except (TypeError, ValueError):
+            batch_size = 50
+        batch_size = max(1, min(batch_size, 1000))
+        unlimited = max_msgs is None or max_msgs <= 0
+
         info = self._published.get(room_id, {})
         is_journal_emoji = (
             info.get("mode") == "journal"
             and self._get_room_config(room_id, "journal_emoji_publish")
         )
-        # (reaction_event_id, target_id, sender, key, timestamp)
-        pending_reactions: list[tuple[str, str, str, str, int]] = []
-        pending_edits: dict[str, tuple[str, str | None]] = {}  # target_event_id -> (body, formatted_body)
+
+        # Resume from checkpoint if we have one.
+        progress = await self._load_backfill_progress(room_id)
+        if progress and progress["status"] == "exhausted":
+            self.log.info(f"Backfill: {room_id} already exhausted, nothing to do")
+            return
+        if progress:
+            end_token: str | None = progress["end_token"]
+            total = int(progress["total"] or 0)
+        else:
+            # No checkpoint: if the room already has stored history (live events),
+            # skip past it via /context. Otherwise start at the live edge.
+            end_token = await self._seed_backfill_token_from_context(room_id)
+            total = 0
+
+        self.log.info(
+            f"Backfill starting for {room_id}: mode={info.get('mode')} "
+            f"max={'unlimited' if unlimited else max_msgs} batch_size={batch_size} "
+            f"resume={'yes' if progress else 'no'} seeded={'yes' if end_token else 'no'}"
+        )
 
         try:
-            while total < max_msgs:
-                batch = min(100, max_msgs - total)
+            while unlimited or total < max_msgs:
+                if unlimited:
+                    batch = batch_size
+                else:
+                    batch = min(batch_size, max_msgs - total)
                 qp: dict[str, str] = {"dir": "b", "limit": str(batch)}
                 if end_token:
                     qp["from"] = end_token
@@ -1089,11 +1482,16 @@ class WebPublishBot(Plugin):
                     )
                 except Exception as e:
                     self.log.warning(f"Backfill request failed for {room_id}: {e}")
-                    break
+                    await self._save_backfill_progress(room_id, end_token, "error", total)
+                    return
 
                 chunk = content.get("chunk", [])
-                if not chunk:
-                    break
+
+                # Per-batch pending state. Flushed before the next batch so
+                # memory doesn't grow unbounded during a long crawl.
+                pending_reactions: list[tuple[str, str, str, str, int]] = []
+                pending_edits: dict[str, tuple[str, str | None]] = {}
+                batch_added = 0
 
                 for raw in chunk:
                     if raw.get("type") == "m.reaction":
@@ -1185,16 +1583,9 @@ class WebPublishBot(Plugin):
                     if info.get("mode") == "journal" and thread_root is None:
                         await self._store_tags(raw["event_id"], room_id, body)
                     total += 1
+                    batch_added += 1
 
-                end_token = content.get("end")
-                if not end_token:
-                    break
-
-            # Persist every collected reaction. Only rows whose target_event_id
-            # ultimately exists in `messages` will render — but we store all of
-            # them so if the target arrives later (partial backfill) they still
-            # surface on next aggregation.
-            if pending_reactions:
+                # Flush this batch's reactions before moving on.
                 for reid, target_id, rsender, rkey, rts in pending_reactions:
                     await self._store_reaction(
                         reaction_event_id=reid,
@@ -1205,24 +1596,23 @@ class WebPublishBot(Plugin):
                         timestamp=rts,
                     )
 
-            # Preserve the 📰 publish-gate pass: mark matching top-level journal
-            # posts as published if a privileged user reacted with 📰.
-            if pending_reactions and is_journal_emoji:
-                author_pl = self._get_room_config(room_id, "journal_author_pl")
-                for _reid, target_id, rsender, rkey, _rts in pending_reactions:
-                    if rkey != "📰":
-                        continue
-                    if not target_id or not rsender:
-                        continue
-                    user_level = await self._get_effective_power_level(room_id, rsender)
-                    if user_level < author_pl:
-                        continue
-                    post = await self._get_post_internal(target_id)
-                    if not post or post["room_id"] != room_id or post["thread_root"] is not None:
-                        continue
-                    await self._publish_post(target_id)
+                # 📰 publish-gate pass for this batch.
+                if pending_reactions and is_journal_emoji:
+                    author_pl = self._get_room_config(room_id, "journal_author_pl")
+                    for _reid, target_id, rsender, rkey, _rts in pending_reactions:
+                        if rkey != "📰":
+                            continue
+                        if not target_id or not rsender:
+                            continue
+                        user_level = await self._get_effective_power_level(room_id, rsender)
+                        if user_level < author_pl:
+                            continue
+                        post = await self._get_post_internal(target_id)
+                        if not post or post["room_id"] != room_id or post["thread_root"] is not None:
+                            continue
+                        await self._publish_post(target_id)
 
-            if pending_edits:
+                # Apply pending edits for this batch.
                 for target_event_id, (new_body, new_formatted_body) in pending_edits.items():
                     await self._update_message_edit(target_event_id, new_body, new_formatted_body)
                     if info.get("mode") == "journal":
@@ -1232,9 +1622,42 @@ class WebPublishBot(Plugin):
                         if thread_root_val is None and new_body:
                             await self._store_tags(target_event_id, room_id, new_body)
 
-            self.log.info(f"Backfill complete for {room_id}: {total} messages stored")
+                next_token = content.get("end")
+                # Persist progress now that this batch is fully in the DB.
+                await self._save_backfill_progress(room_id, next_token, "running", total)
+
+                # Terminal conditions
+                if not chunk:
+                    # Empty chunk: treat as exhausted.
+                    await self._save_backfill_progress(room_id, next_token, "exhausted", total)
+                    self.log.info(
+                        f"Backfill exhausted for {room_id}: {total} messages stored (empty chunk)"
+                    )
+                    return
+                if not next_token:
+                    await self._save_backfill_progress(room_id, None, "exhausted", total)
+                    self.log.info(
+                        f"Backfill exhausted for {room_id}: {total} messages stored"
+                    )
+                    return
+                end_token = next_token
+
+                if not unlimited and total >= max_msgs:
+                    await self._save_backfill_progress(room_id, end_token, "capped", total)
+                    self.log.info(
+                        f"Backfill capped for {room_id}: {total} messages (max_backfill={max_msgs})"
+                    )
+                    return
+
+                await asyncio.sleep(self._BACKFILL_BATCH_SLEEP)
+
+        except asyncio.CancelledError:
+            await self._save_backfill_progress(room_id, end_token, "running", total)
+            self.log.info(f"Backfill cancelled for {room_id} at {total} messages")
+            raise
         except Exception as e:
             self.log.error(f"Backfill error for {room_id}: {e}")
+            await self._save_backfill_progress(room_id, end_token, "error", total)
 
     # ------------------------------------------------------------------
     # Live event handlers
@@ -1747,6 +2170,92 @@ class WebPublishBot(Plugin):
         if payload is not None:
             self._notify_sse(evt.room_id, "pinned_changed", payload)
 
+    @event.on(EventType.find("m.room.tombstone", t_class=EventType.Class.STATE))
+    async def handle_tombstone_state(self, evt) -> None:
+        if evt.room_id not in self._published:
+            return
+        if getattr(evt, "state_key", "") != "":
+            return
+        content = evt.content
+        if hasattr(content, "serialize"):
+            content = content.serialize()
+        succession = dict(self._room_succession.get(evt.room_id) or {
+            "has_tombstone": False,
+            "replacement_room": "",
+            "tombstone_ts": None,
+            "predecessor_room": None,
+        })
+        if isinstance(content, dict):
+            succession["has_tombstone"] = True
+            repl = content.get("replacement_room", "")
+            succession["replacement_room"] = repl if isinstance(repl, str) else ""
+            ts = getattr(evt, "timestamp", None) or getattr(evt, "origin_server_ts", None)
+            if ts is not None:
+                try:
+                    succession["tombstone_ts"] = int(ts)
+                except (TypeError, ValueError):
+                    pass
+        self._room_succession[evt.room_id] = succession
+        banner_html = self._render_succession_banner_for_room(evt.room_id)
+        self._notify_sse(evt.room_id, "succession_changed", {"banner_html": banner_html})
+        replacement = succession.get("replacement_room") or ""
+        self.log.info(
+            f"Tombstone state fired on {evt.room_id}: replacement="
+            f"{replacement!r} (published={evt.room_id in self._published})"
+        )
+        if replacement:
+            self._launch_migration(evt.room_id, replacement)
+
+    @event.on(EventType.find("m.room.member", t_class=EventType.Class.STATE))
+    async def handle_member_state(self, evt) -> None:
+        """When the bot is invited to a room whose `m.room.create.predecessor`
+        points to a published room, complete the migration (join + publish +
+        archive). Covers the race where the tombstone handler fires before
+        the invite has propagated to the bot's sync."""
+        try:
+            bot_mxid = self.client.mxid
+        except Exception:
+            return
+        if getattr(evt, "state_key", "") != bot_mxid:
+            return
+        content = evt.content
+        if hasattr(content, "serialize"):
+            content = content.serialize()
+        if not isinstance(content, dict):
+            return
+        if content.get("membership") != "invite":
+            return
+        new_room_id = evt.room_id
+        if new_room_id in self._published:
+            return
+        # Look up predecessor on the invited room. State API works on invited
+        # rooms for key state events via the /state endpoint.
+        try:
+            create_content = await self.client.api.request(
+                Method.GET,
+                Path.v3.rooms[new_room_id].state["m.room.create"],
+            )
+        except Exception as e:
+            self.log.debug(
+                f"Invite to {new_room_id}: cannot read m.room.create yet: {e!r}"
+            )
+            return
+        if not isinstance(create_content, dict):
+            return
+        predecessor = create_content.get("predecessor") or {}
+        if not isinstance(predecessor, dict):
+            return
+        old_room_id = predecessor.get("room_id", "")
+        if not isinstance(old_room_id, str) or not old_room_id:
+            return
+        if old_room_id not in self._published:
+            return
+        self.log.info(
+            f"Invite: {new_room_id} has predecessor {old_room_id} which is "
+            f"published; launching migration"
+        )
+        self._launch_migration(old_room_id, new_room_id)
+
     @event.on(EventType.find("m.room.avatar", t_class=EventType.Class.STATE))
     async def handle_room_avatar_state(self, evt) -> None:
         if evt.room_id not in self._published:
@@ -2000,6 +2509,7 @@ class WebPublishBot(Plugin):
                 comment_counts=comment_counts,
                 thread_participants=thread_participants,
                 pinned_banner_html=pinned_banner,
+                succession_banner_html=self._render_succession_banner_for_room(room_id),
             )
         else:
             page = int(req.query.get("page", "1"))
@@ -2036,6 +2546,7 @@ class WebPublishBot(Plugin):
                 base_url=self._base_url,
                 room_avatar_url=room_avatar_url,
                 pinned_section_html=pinned_section_html,
+                succession_banner_html=self._render_succession_banner_for_room(room_id),
             )
 
         return Response(text=html, content_type="text/html",

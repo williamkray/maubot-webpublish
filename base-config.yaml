@@ -9,8 +9,15 @@
 css: ""
 # Number of entries per page in journal mode
 pagination: 10
-# Maximum number of messages to backfill when publishing a room
+# Maximum number of messages to backfill when publishing a room.
+# Set to 0 to crawl the room's full history in the background (resumable across
+# plugin restarts). The first batch lands quickly so the site is usable right away;
+# the crawl then continues backward until the homeserver runs out of history.
 max_backfill: 1000
+# Events fetched per /messages request during backfill. Smaller values are gentler
+# on the homeserver and let it interleave real traffic; larger values reduce
+# round-trip overhead. Clamped to [1, 1000]. Default 50.
+backfill_batch_size: 50
 # Minimum power level required to publish/disable rooms (100 = room admin)
 min_power_level: 100
 # Minimum power level required to post top-level entries in journal rooms (ignored for chat rooms)

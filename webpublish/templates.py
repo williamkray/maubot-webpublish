@@ -260,6 +260,29 @@ def matrix_event_uri(room_id: str, event_id: str, homeserver_url: str = "") -> s
     return uri
 
 
+def matrix_room_uri(room_id: str, alias: str = "", homeserver_url: str = "") -> str:
+    """Build a matrix: URI for a room, preferring the `matrix:r/<alias>` form
+    (widely supported by clients) when an alias is known. Falls back to
+    `matrix:roomid/<id>?via=<bot_homeserver>`. The via is taken from the bot's
+    homeserver since the bot is (or was) in the room \u2014 that server can serve
+    federation for it. Works the same for v12 rooms whose ids have no server
+    part; don't try to derive a via from the room id itself.
+    """
+    if alias:
+        a = alias.lstrip("#")
+        if a:
+            return f"matrix:r/{quote(a, safe=':')}"
+    rid = room_id.lstrip("!")
+    if not rid:
+        return ""
+    uri = f"matrix:roomid/{quote(rid, safe=':')}"
+    if homeserver_url:
+        host = urlparse(homeserver_url).hostname
+        if host:
+            uri += f"?via={quote(host)}"
+    return uri
+
+
 # ---------------------------------------------------------------------------
 # Message body rendering
 # ---------------------------------------------------------------------------
@@ -744,6 +767,7 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   background: var(--bg); color: var(--text); line-height: 1.5;
   min-height: 100dvh;
+  display: flex; flex-direction: column;
 }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -888,7 +912,7 @@ body.webpublish-chat-mode .webpublish-pinned-list {
 .webpublish-redacted { color: var(--text-muted); }
 
 /* ---- journal mode ---- */
-.webpublish-journal { max-width: 800px; margin: 0 auto; padding: 0 24px; }
+.webpublish-journal { max-width: 800px; margin: 0 auto; padding: 0 24px; width: 100%; flex: 1 0 auto; }
 .webpublish-posts   { margin-top: 24px; }
 .webpublish-post-preview {
   border: 1px solid var(--border); border-radius: 8px; padding: 24px;
@@ -917,7 +941,7 @@ body.webpublish-chat-mode .webpublish-pinned-list {
 .webpublish-text-muted { color: var(--text-muted); }
 
 /* journal post detail */
-.webpublish-post-full { max-width: 800px; margin: 0 auto; padding: 24px; }
+.webpublish-post-full { max-width: 800px; margin: 0 auto; padding: 24px; width: 100%; flex: 1 0 auto; }
 .webpublish-post-full .webpublish-post-body {
   margin: 24px 0; line-height: 1.7; text-align: justify; hyphens: auto;
 }
@@ -1047,6 +1071,18 @@ body.has-thread-panel .webpublish-chat .webpublish-messages {
     padding-right: 32px;
   }
 }
+.webpublish-succession-banner {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 12px; flex-wrap: wrap;
+  padding: 6px 0; font-size: 0.85rem; color: var(--text-muted);
+}
+.webpublish-succession-left, .webpublish-succession-right {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+}
+.webpublish-succession-right { margin-left: auto; }
+.webpublish-succession-link { color: var(--text-muted); text-decoration: none; }
+.webpublish-succession-link:hover { color: var(--accent); }
+.webpublish-succession-archived { font-style: italic; }
 """
 
 
@@ -1330,6 +1366,19 @@ def _sse_chat_script(encoded_alias: str) -> str:
         '      existing.remove();\n'
         '    }\n'
         '  });\n'
+        '  src.addEventListener("succession_changed", function(e) {\n'
+        '    var d = JSON.parse(e.data);\n'
+        '    var existing = document.querySelector(".webpublish-succession-banner");\n'
+        '    if (d.banner_html) {\n'
+        '      if (existing) { existing.outerHTML = d.banner_html; }\n'
+        '      else {\n'
+        '        var anchor = document.querySelector("main") || document.body;\n'
+        '        anchor.insertAdjacentHTML("afterend", d.banner_html);\n'
+        '      }\n'
+        '    } else if (existing) {\n'
+        '      existing.remove();\n'
+        '    }\n'
+        '  });\n'
         '})();\n'
         '</script>'
     )
@@ -1453,6 +1502,19 @@ def _sse_journal_landing_script(encoded_alias: str) -> str:
         '      else {\n'
         '        var main = document.querySelector(".webpublish-journal");\n'
         '        if (main) main.insertAdjacentHTML("afterbegin", d.html);\n'
+        '      }\n'
+        '    } else if (existing) {\n'
+        '      existing.remove();\n'
+        '    }\n'
+        '  });\n'
+        '  src.addEventListener("succession_changed", function(e) {\n'
+        '    var d = JSON.parse(e.data);\n'
+        '    var existing = document.querySelector(".webpublish-succession-banner");\n'
+        '    if (d.banner_html) {\n'
+        '      if (existing) { existing.outerHTML = d.banner_html; }\n'
+        '      else {\n'
+        '        var anchor = document.querySelector("main") || document.body;\n'
+        '        anchor.insertAdjacentHTML("afterend", d.banner_html);\n'
         '      }\n'
         '    } else if (existing) {\n'
         '      existing.remove();\n'
@@ -1666,6 +1728,108 @@ def render_pinned_section_html(
     )
 
 
+def render_succession_banner(
+    succession: dict,
+    published_rooms_by_room_id: dict[str, dict],
+    base_url: str,
+    alias_hints: dict[str, str] | None = None,
+    homeserver_url: str = "",
+) -> str:
+    """Footer banner linking to a replacement room (tombstone) and/or the
+    predecessor room (m.room.create predecessor). Empty string when the room
+    has neither a tombstone nor a predecessor.
+
+    `succession` shape (see WebPublishBot._room_succession):
+      - has_tombstone: bool
+      - replacement_room: str ("" = explicit dead-end)
+      - tombstone_ts: int | None (ms since epoch)
+      - predecessor_room: str | None
+
+    `published_rooms_by_room_id` maps room_id -> {"alias": ...} for locally
+    published rooms; used to decide between an internal link and a matrix: URI.
+    """
+    if not succession:
+        return ""
+    has_tomb = bool(succession.get("has_tombstone"))
+    replacement = succession.get("replacement_room") or ""
+    predecessor = succession.get("predecessor_room") or ""
+    if not has_tomb and not predecessor:
+        return ""
+
+    hints = alias_hints or {}
+
+    def _internal_or_matrix_href(target_room_id: str) -> str:
+        pub = published_rooms_by_room_id.get(target_room_id)
+        if pub and pub.get("alias") and base_url:
+            a = pub["alias"]
+            if a == "/":
+                return f"{base_url}/"
+            return f"{base_url}/{quote(a, safe='')}"
+        return matrix_room_uri(
+            target_room_id, hints.get(target_room_id, ""), homeserver_url,
+        )
+
+    # Left group: back-link to the predecessor (if any).
+    left_parts: list[str] = []
+    if predecessor:
+        href = _internal_or_matrix_href(predecessor)
+        left_parts.append(
+            f'<a class="webpublish-succession-link webpublish-succession-back" '
+            f'href="{escape(href)}">&larr; View Archive</a>'
+        )
+
+    # Right group: "this room was archived" text (whenever the room is
+    # tombstoned, regardless of whether a replacement is set), followed by
+    # the forward-link when a replacement exists.
+    right_parts: list[str] = []
+    if has_tomb:
+        ts = succession.get("tombstone_ts")
+        date_str = ""
+        if isinstance(ts, int) and ts > 0:
+            try:
+                date_str = datetime.fromtimestamp(
+                    ts / 1000, tz=timezone.utc
+                ).strftime("%Y-%m-%d")
+            except (OSError, ValueError, OverflowError):
+                date_str = ""
+        if date_str:
+            right_parts.append(
+                f'<span class="webpublish-succession-archived">'
+                f'This site was archived on {escape(date_str)}.</span>'
+            )
+        else:
+            right_parts.append(
+                '<span class="webpublish-succession-archived">'
+                'This site was archived.</span>'
+            )
+        if replacement:
+            href = _internal_or_matrix_href(replacement)
+            right_parts.append(
+                f'<a class="webpublish-succession-link webpublish-succession-forward" '
+                f'href="{escape(href)}">View Current Content &rarr;</a>'
+            )
+
+    if not left_parts and not right_parts:
+        return ""
+
+    left_html = (
+        '  <div class="webpublish-succession-left">\n    '
+        + "\n    ".join(left_parts)
+        + "\n  </div>\n"
+    ) if left_parts else ""
+    right_html = (
+        '  <div class="webpublish-succession-right">\n    '
+        + "\n    ".join(right_parts)
+        + "\n  </div>\n"
+    ) if right_parts else ""
+    return (
+        '<div class="webpublish-succession-banner">\n'
+        + left_html
+        + right_html
+        + '</div>'
+    )
+
+
 def _pinned_toggle_script() -> str:
     return (
         '<script>\n'
@@ -1712,6 +1876,7 @@ def render_chat_page(
     comment_counts: dict[str, int] | None = None,
     thread_participants: dict[str, list[dict]] | None = None,
     pinned_banner_html: str = "",
+    succession_banner_html: str = "",
 ) -> str:
     counts = comment_counts or {}
     parts = thread_participants or {}
@@ -1745,6 +1910,7 @@ def render_chat_page(
         '<button class="webpublish-jump-latest" type="button" hidden>'
         '&#x2B07; Jump to newest</button>'
     )
+    succession_footer = f'{succession_banner_html}\n' if succession_banner_html else ''
     return (
         f'{head}\n<body class="webpublish-chat-mode">\n'
         f'<header class="webpublish-header">\n'
@@ -1755,6 +1921,7 @@ def render_chat_page(
         f'  <div class="webpublish-messages" id="messages">\n{msgs_html}\n  </div>\n'
         f'</main>\n'
         f'<aside class="webpublish-thread-panel" id="thread-panel" hidden></aside>\n'
+        f'{succession_footer}'
         f'{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n{panel_script}\n{pinned_script}\n{scroll_script}\n'
         f'</body>\n</html>'
     )
@@ -1804,6 +1971,7 @@ def render_journal_landing(
     base_url: str = "",
     room_avatar_url: str = "",
     pinned_section_html: str = "",
+    succession_banner_html: str = "",
 ) -> str:
     og = _og_meta_site(room_name, room_topic, encoded_alias, base_url, room_avatar_url, base_url) if base_url else ""
     head = _page_head(room_name, custom_css, og_meta=og)
@@ -1840,6 +2008,7 @@ def render_journal_landing(
     sse = _sse_journal_landing_script(encoded_alias)
     scroll_script = _scroll_header_script()
     avatar_img = _render_room_avatar_img(room_avatar_url, base_url)
+    succession_footer = f'{succession_banner_html}\n' if succession_banner_html else ''
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
@@ -1850,7 +2019,7 @@ def render_journal_landing(
         f'  <div class="webpublish-posts">\n{posts_html}\n  </div>\n'
         f'  {pag_html}\n'
         f'{feed_footer}'
-        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{sse}\n{scroll_script}\n</body>\n</html>'
+        f'</main>\n{succession_footer}{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{sse}\n{scroll_script}\n</body>\n</html>'
     )
 
 

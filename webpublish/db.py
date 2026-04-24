@@ -110,3 +110,16 @@ async def upgrade_v9(conn: Connection) -> None:
     await conn.execute(
         "CREATE INDEX idx_reactions_room ON reactions (room_id)"
     )
+
+
+@upgrade_table.register(description="Add backfill_progress table for resumable full-history crawls")
+async def upgrade_v10(conn: Connection) -> None:
+    await conn.execute("""
+        CREATE TABLE backfill_progress (
+            room_id     TEXT PRIMARY KEY,
+            end_token   TEXT,
+            status      TEXT NOT NULL,
+            total       INTEGER NOT NULL DEFAULT 0,
+            updated_at  BIGINT NOT NULL
+        )
+    """)
