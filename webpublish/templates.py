@@ -120,6 +120,92 @@ def parse_hashtags(body: str) -> list[str]:
     return sorted({t.lower() for t in _HASHTAG_RE.findall(body)})
 
 
+# Auto-linkify patterns for plaintext message bodies and topics. Order of
+# alternation matters: the Matrix-identifier branch must precede the bare-email
+# branch so `@user:server.tld` matches as a MXID, not an email.
+_LINKIFY_RE = re.compile(
+    r"""(?P<url>https?://[^\s<>]+)
+        |(?P<matrix>matrix:[^\s<>]+)
+        |(?P<mailto>mailto:[^\s<>]+@[^\s<>]+)
+        |(?P<mxid>[#@!][^\s:]+:[A-Za-z0-9.\-]+\.[A-Za-z]{2,}(?::\d+)?)
+        |(?P<email>[\w.+\-]+@[\w\-]+\.[\w.\-]+)
+    """,
+    re.VERBOSE,
+)
+_MXID_SIGIL_TO_MATRIX_PREFIX = {"#": "r/", "@": "u/", "!": "roomid/"}
+
+
+def _trim_trailing_punct(s: str) -> tuple[str, str]:
+    """Strip trailing punctuation unlikely to be part of a URL.
+
+    Returns (url, trailing). Always strips `.,;:!?`. Strips an unbalanced
+    closing bracket (`)]}>`) — e.g. the outer `)` in
+    `(https://en.wikipedia.org/wiki/Foo_(bar))` — while leaving matched
+    brackets intact. A trailing matched quote (`"`, `'`) is also stripped when
+    there's an odd count in the URL."""
+    bracket_pairs = {")": "(", "]": "[", "}": "{", ">": "<"}
+    quote_chars = ('"', "'")
+    trailing = ""
+    while s:
+        c = s[-1]
+        if c in ".,;:!?":
+            trailing = c + trailing
+            s = s[:-1]
+        elif c in bracket_pairs:
+            opener = bracket_pairs[c]
+            if s[:-1].count(opener) < s[:-1].count(c) + 1:
+                trailing = c + trailing
+                s = s[:-1]
+            else:
+                break
+        elif c in quote_chars and s[:-1].count(c) % 2 == 0:
+            trailing = c + trailing
+            s = s[:-1]
+        else:
+            break
+    return s, trailing
+
+
+def linkify_plaintext(text: str, newlines_to_br: bool = True) -> str:
+    """Escape plaintext and wrap recognizable URLs, Matrix URIs, mailto/email,
+    and bare Matrix identifiers (#room:server, @user:server, !id:server) in
+    anchor tags. For use on render paths that don't have a formatted_body."""
+    if not text:
+        return ""
+    out: list[str] = []
+    pos = 0
+    for m in _LINKIFY_RE.finditer(text):
+        start, end = m.span()
+        if start > pos:
+            chunk = escape(text[pos:start])
+            out.append(chunk.replace("\n", "<br>") if newlines_to_br else chunk)
+        match = m.group(0)
+        match, trailing = _trim_trailing_punct(match)
+        if not match:
+            # Entire match was trimmed away (edge case); emit as plain text.
+            out.append(escape(m.group(0)))
+            pos = end
+            continue
+        if m.lastgroup == "email":
+            href = f"mailto:{match}"
+        elif m.lastgroup == "mxid":
+            sigil, rest = match[0], match[1:]
+            href = f"matrix:{_MXID_SIGIL_TO_MATRIX_PREFIX[sigil]}{rest}"
+        else:
+            href = match
+        out.append(
+            f'<a href="{escape(href)}" target="_blank" rel="noopener nofollow">'
+            f'{escape(match)}</a>'
+        )
+        if trailing:
+            out.append(escape(trailing))
+        pos = end
+    if pos < len(text):
+        chunk = escape(text[pos:])
+        out.append(chunk.replace("\n", "<br>") if newlines_to_br else chunk)
+    return "".join(out)
+
+
 def sender_color(mxid: str) -> str:
     h = int(hashlib.md5(mxid.encode()).hexdigest(), 16)
     return _SENDER_COLORS[h % len(_SENDER_COLORS)]
@@ -198,7 +284,7 @@ def render_body(msg: dict, homeserver_url: str, proxy_base_url: str = "", journa
                 if formatted:
                     text_block = f'<div class="webpublish-image-body">{sanitize_html(formatted, homeserver_url, proxy_base_url)}</div>'
                 elif not is_filename:
-                    text_block = f'<div class="webpublish-image-body">{escape(body_text).replace(chr(10), "<br>")}</div>'
+                    text_block = f'<div class="webpublish-image-body">{linkify_plaintext(body_text)}</div>'
                 else:
                     text_block = ""
                 figure = f'<figure class="webpublish-figure webpublish-figure-full">{linked}</figure>'
@@ -243,14 +329,14 @@ def render_body(msg: dict, homeserver_url: str, proxy_base_url: str = "", journa
 
     if msgtype == "m.emote":
         name = escape(msg.get("sender_name") or msg.get("sender", ""))
-        body = escape(msg.get("body", ""))
+        body = linkify_plaintext(msg.get("body", ""), newlines_to_br=False)
         return f"<em>* {name} {body}</em>"
 
     # m.text, m.notice, fallback
     formatted = msg.get("formatted_body")
     if formatted:
         return sanitize_html(formatted, homeserver_url, proxy_base_url)
-    return escape(msg.get("body", "")).replace("\n", "<br>")
+    return linkify_plaintext(msg.get("body", ""))
 
 
 # Unicode emoji ranges for "big emoji" detection. Intentionally broad but
@@ -1577,7 +1663,7 @@ def render_chat_page(
         ))
     msgs_html = "\n".join(msg_chunks)
     topic_p = (
-        f"  <p>{escape(room_topic)}</p>\n"
+        f"  <p>{linkify_plaintext(room_topic, newlines_to_br=False)}</p>\n"
         f'  <button class="webpublish-topic-toggle" type="button" aria-expanded="false" hidden>Show more</button>'
     ) if room_topic else ""
     sse = _sse_chat_script(encoded_alias)
@@ -1655,7 +1741,7 @@ def render_journal_landing(
     og = _og_meta_site(room_name, room_topic, encoded_alias, base_url, room_avatar_url, base_url) if base_url else ""
     head = _page_head(room_name, custom_css, og_meta=og)
     topic_p = (
-        f"  <p>{escape(room_topic)}</p>\n"
+        f"  <p>{linkify_plaintext(room_topic, newlines_to_br=False)}</p>\n"
         f'  <button class="webpublish-topic-toggle" type="button" aria-expanded="false" hidden>Show more</button>'
     ) if room_topic else ""
 
@@ -1748,7 +1834,7 @@ def render_journal_post(
     back_href = "../" if not encoded_alias else f"../../{encoded_alias}"
     avatar_img = _render_room_avatar_img(room_avatar_url, proxy_base_url)
     topic_p = (
-        f"  <p>{escape(room_topic)}</p>\n"
+        f"  <p>{linkify_plaintext(room_topic, newlines_to_br=False)}</p>\n"
         f'  <button class="webpublish-topic-toggle" type="button" aria-expanded="false" hidden>Show more</button>'
     ) if room_topic else ""
     return (
