@@ -112,11 +112,17 @@ _SENDER_COLORS = [
     "#e040fb", "#00e5ff", "#76ff03", "#ffd740",
 ]
 
-# Matches #hashtags; rejects Matrix room aliases (#room:server) via lookahead
-_HASHTAG_RE = re.compile(r'(?<![&\w])#([a-zA-Z][a-zA-Z0-9_-]{0,49})(?![:\w])')
+# Matrix room aliases (#localpart:server.tld). Localparts are very permissive
+# per the spec (any non-surrogate Unicode except `:` and NUL), so we strip the
+# whole alias before hashtag extraction rather than enumerating allowed chars
+# in the hashtag regex's lookahead.
+_MATRIX_ALIAS_RE = re.compile(r'#[^\s:#]+:[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
+
+_HASHTAG_RE = re.compile(r'(?<![&\w])#([a-zA-Z][a-zA-Z0-9_-]{0,49})(?![:\w-])')
 
 
 def parse_hashtags(body: str) -> list[str]:
+    body = _MATRIX_ALIAS_RE.sub("", body)
     return sorted({t.lower() for t in _HASHTAG_RE.findall(body)})
 
 
