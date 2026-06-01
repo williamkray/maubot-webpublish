@@ -34,7 +34,7 @@ Messages arrive via `@event.on(EventType.ROOM_MESSAGE)` in `handle_message()`, g
 
 Set per-room via `!webpublish chat|journal`:
 
-- **chat** — Top-level messages render as a scrollable chat log. Threaded replies are hidden from the main list; each root message that has replies shows a `.webpublish-thread-indicator` (count + up to 5 participant avatars) which opens a right-side `<aside id="thread-panel">` panel. The panel is lazy-loaded from `/{alias}/thread/{event_id}`, deep-linkable via `?thread=<event_id>`, and covers the full viewport on screens <600px.
+- **chat** — Top-level messages render as a scrollable chat log. The initial page renders only the most-recent window (`_get_messages(..., limit=200)` in `_handle_main`); **older history loads on demand** when the browser scrolls near the top of `#messages`, fetching a batch (`_CHAT_OLDER_BATCH`) from `/{alias}/older?before=<timestamp_ms>` (`_handle_older_fragment` → `_get_messages_before`) and prepending it. The cursor is the oldest rendered message's `data-ts` attribute; the client (`_chat_load_older_script`) dedupes by element id and preserves scroll position. Threaded replies are hidden from the main list; each root message that has replies shows a `.webpublish-thread-indicator` (count + up to 5 participant avatars) which opens a right-side `<aside id="thread-panel">` panel. The panel is lazy-loaded from `/{alias}/thread/{event_id}`, deep-linkable via `?thread=<event_id>`, and covers the full viewport on screens <600px.
 - **journal** — Top-level messages are blog posts; threaded replies are comments on a post. The `thread_root` column in `messages` links comments to their post.
 
 ### Live updates (SSE)
@@ -129,7 +129,7 @@ Always add `self.log.debug(f"...: {e}")` in the except clause so failures are vi
 
 `@web.*` decorated methods are registered via `dir()` (alphabetical by method name). Dynamic routes like `/{alias}` shadow literal routes registered later alphabetically — put specific routes on methods that sort *before* the catch-all, or use a regex pattern like `/{alias:[^/]+}` to prevent empty-alias matches.
 
-Reserved alias names (checked in `setpath`, set as `RESERVED_ALIASES` in `bot.py`): `media`, `tiles`, `theme`, `tag`, `tags`, `post`, `sse`, `feed.xml`, `thread`. Any URI that would collide with a literal route segment belongs here.
+Reserved alias names (checked in `setpath`, set as `RESERVED_ALIASES` in `bot.py`): `media`, `tiles`, `theme`, `tag`, `tags`, `post`, `sse`, `feed.xml`, `thread`, `older`. Any URI that would collide with a literal route segment belongs here.
 
 ### Maubot trailing-slash invariant
 
@@ -152,6 +152,8 @@ Known parity points to keep in sync:
 
 `_backfill_room_inner()` supports two modes, driven by the `max_backfill` config:
 - `max_backfill > 0` — bounded. Crawl stops when `total >= max_backfill` (`status='capped'`) or when the homeserver returns no `end_token` (`status='exhausted'`).
+
+**Pagination gotcha — an empty `chunk` is NOT end-of-history.** Synapse can return `chunk: []` *with* a valid `end` token while paging backward across sparse windows (state events, lazy backfill boundaries). The terminal signal is the **absence of `end`** (or a non-advancing token), never an empty chunk — keep paging until `end` disappears. Treating the first empty chunk as `exhausted` silently truncates rooms mid-history. Refs: <https://matrix-org.github.io/synapse/latest/admin_api/rooms.html>.
 - `max_backfill <= 0` — unlimited. Crawl continues until `status='exhausted'`, pacing with `_BACKFILL_BATCH_SLEEP` (default 1.0s) between `/messages` requests.
 
 Progress is persisted per batch in the `backfill_progress` table (`room_id`, `end_token`, `status`, `total`, `updated_at`). On plugin start, `_resume_backfills()` re-launches any room whose status is `'running'`. `!webpublish rebuild` deletes the checkpoint + all stored messages before kicking a fresh crawl. Re-fetching an event is idempotent (messages use `INSERT ... ON CONFLICT DO NOTHING`).
@@ -159,6 +161,14 @@ Progress is persisted per batch in the `backfill_progress` table (`room_id`, `en
 First-time backfill of a room with pre-existing live-stored events seeds the pagination token via `/rooms/{id}/context/{oldest_event_id}` so the crawler skips past what we already have. Failure falls back to starting at the live edge.
 
 Background crawl tasks are tracked in `self._backfill_tasks` and cancelled in `stop()`; the `CancelledError` path saves a `'running'` checkpoint so the crawl picks up where it left off on next start.
+
+### Diagnosing "the site is missing older history"
+
+Three independent layers can each cap visible history — check them in order, they are NOT the same thing:
+
+1. **Render window (most common, chat mode).** The page renders only the most-recent `limit` messages; older ones load via scroll-to-top `/{alias}/older`. If JS/pagination is broken the DB can be full yet the page looks capped. Tell: `SELECT COUNT(*) FROM messages WHERE room_id=$1` ≫ visible count; redacting any recent message reveals exactly one more at the top.
+2. **Backfill storage.** Only `max_backfill`-bounded *and* the empty-chunk gotcha above limit what's stored. Tell: `backfill_progress.total` ≈ visible count and `status='exhausted'`/`'capped'`. A config change (e.g. raising `max_backfill`) does NOT auto-re-crawl — only publish/`rebuild`/startup-resume(`running`)/migration launch a backfill, and an `'exhausted'` row short-circuits relaunch (`bot.py` ~`_backfill_room_inner` head). Use `!webpublish rebuild` to force a fresh crawl.
+3. **Homeserver/history-visibility.** The bot only retrieves what its account+server can read. A clean crawl that exhausts (empty `end_token`) at a low `total` despite known older history points here — but rule out only after confirming the bot was a member since the start and is on a server that holds the history.
 
 ### Adding a message field — checklist
 
