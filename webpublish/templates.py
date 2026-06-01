@@ -516,7 +516,7 @@ def render_message_html(
     reactions_section = f'    {reactions_html}\n' if reactions_html else ""
 
     return (
-        f'<div class="webpublish-message{notice_cls}" id="{eid}">\n'
+        f'<div class="webpublish-message{notice_cls}" id="{eid}" data-ts="{msg["timestamp"]}">\n'
         f'  <div class="webpublish-avatar" style="background-color:{color}">{initials}{avatar_img}</div>\n'
         f'  <div class="webpublish-message-content">\n'
         f'    {reply_html}'
@@ -1390,6 +1390,53 @@ def _sse_chat_script(encoded_alias: str) -> str:
     )
 
 
+def _chat_load_older_script(encoded_alias: str) -> str:
+    # Scroll-to-top pagination: when the user nears the top of the message log,
+    # fetch the batch of messages older than the current oldest (cursor =
+    # firstElementChild's data-ts) and prepend them, preserving scroll position.
+    older_url = "./older" if not encoded_alias else f"./{encoded_alias}/older"
+    return (
+        '<script>\n'
+        '(function() {\n'
+        '  var msgs = document.getElementById("messages");\n'
+        '  if (!msgs) return;\n'
+        '  var loading = false, exhausted = false;\n'
+        '  function loadOlder() {\n'
+        '    if (loading || exhausted) return;\n'
+        '    var first = msgs.firstElementChild;\n'
+        '    var cursor = first && first.dataset ? first.dataset.ts : null;\n'
+        '    if (!cursor) return;\n'
+        '    loading = true;\n'
+        f'    fetch("{older_url}?before=" + encodeURIComponent(cursor), '
+        '{headers: {"Accept": "text/html"}})\n'
+        '      .then(function(r) { return r.ok ? r.text() : ""; })\n'
+        '      .then(function(html) {\n'
+        '        if (!html || !html.trim()) { exhausted = true; return; }\n'
+        '        var tpl = document.createElement("div");\n'
+        '        tpl.innerHTML = html;\n'
+        '        var nodes = Array.prototype.slice.call(tpl.children).filter(function(n) {\n'
+        '          return !(n.id && document.getElementById(n.id));\n'
+        '        });\n'
+        '        if (!nodes.length) { exhausted = true; return; }\n'
+        '        var prevHeight = msgs.scrollHeight, prevTop = msgs.scrollTop;\n'
+        '        for (var i = nodes.length - 1; i >= 0; i--) {\n'
+        '          msgs.insertBefore(nodes[i], msgs.firstChild);\n'
+        '          if (window._wpLocalizeTimestamps) window._wpLocalizeTimestamps(nodes[i]);\n'
+        '          if (window._wpInitMaps) window._wpInitMaps(nodes[i]);\n'
+        '        }\n'
+        '        msgs.scrollTop = prevTop + (msgs.scrollHeight - prevHeight);\n'
+        '      })\n'
+        '      .catch(function() {})\n'
+        '      .finally(function() { loading = false; });\n'
+        '  }\n'
+        '  msgs.addEventListener("scroll", function() {\n'
+        '    if (msgs.scrollTop < 150) loadOlder();\n'
+        '  }, {passive: true});\n'
+        '})();\n'
+        '</script>'
+    )
+
+
 def _thread_panel_script(encoded_alias: str) -> str:
     # Base URL for thread fragment fetches is computed client-side to keep the
     # script alias-agnostic; the server registers both /{alias}/thread/{id}
@@ -1905,6 +1952,7 @@ def render_chat_page(
         f'  <button class="webpublish-topic-toggle" type="button" aria-expanded="false" hidden>Show more</button>'
     ) if room_topic else ""
     sse = _sse_chat_script(encoded_alias)
+    load_older = _chat_load_older_script(encoded_alias)
     panel_script = _thread_panel_script(encoded_alias)
     pinned_script = _pinned_toggle_script()
     leaflet_init = f"\n{_LEAFLET_INIT_SCRIPT}" if has_maps else ""
@@ -1928,7 +1976,7 @@ def render_chat_page(
         f'</main>\n'
         f'<aside class="webpublish-thread-panel" id="thread-panel" hidden></aside>\n'
         f'{succession_footer}'
-        f'{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n{panel_script}\n{pinned_script}\n{scroll_script}\n'
+        f'{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n{load_older}\n{panel_script}\n{pinned_script}\n{scroll_script}\n'
         f'</body>\n</html>'
     )
 

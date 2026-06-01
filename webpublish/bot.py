@@ -53,7 +53,11 @@ CONFIG_STATE_TYPE = "org.jobmachine.webpublish.config"
 # Aliases that would collide with web routes if allowed as a room URI.
 RESERVED_ALIASES: frozenset[str] = frozenset({
     "media", "tiles", "theme", "tag", "tags", "post", "sse", "feed.xml", "thread",
+    "older",
 })
+
+# Batch size for chat-mode scroll-to-top "load older" requests.
+_CHAT_OLDER_BATCH = 50
 
 
 def _parse_bool(s: str) -> bool:
@@ -321,6 +325,28 @@ class WebPublishBot(Plugin):
                 "SELECT * FROM messages WHERE room_id=$1 AND redacted=FALSE "
                 "ORDER BY timestamp DESC LIMIT $2",
                 room_id, limit,
+            )
+        return [dict(r) for r in reversed(rows)]
+
+    async def _get_messages_before(
+        self, room_id: str, before_ts: int, limit: int = 50,
+        top_level_only: bool = True,
+    ) -> list[dict]:
+        """Fetch the batch of messages immediately older than before_ts, for
+        chat-mode scroll-to-top pagination. Returned chronological (oldest
+        first) to match the main list's ordering."""
+        if top_level_only:
+            rows = await self.database.fetch(
+                "SELECT * FROM messages WHERE room_id=$1 AND redacted=FALSE "
+                "AND thread_root IS NULL AND timestamp < $2 "
+                "ORDER BY timestamp DESC LIMIT $3",
+                room_id, before_ts, limit,
+            )
+        else:
+            rows = await self.database.fetch(
+                "SELECT * FROM messages WHERE room_id=$1 AND redacted=FALSE "
+                "AND timestamp < $2 ORDER BY timestamp DESC LIMIT $3",
+                room_id, before_ts, limit,
             )
         return [dict(r) for r in reversed(rows)]
 
@@ -1622,20 +1648,22 @@ class WebPublishBot(Plugin):
                         if thread_root_val is None and new_body:
                             await self._store_tags(target_event_id, room_id, new_body)
 
+                # The token we paginated from this batch; used to detect a
+                # non-advancing token (runaway guard) below.
+                prev_token = end_token
                 next_token = content.get("end")
                 # Persist progress now that this batch is fully in the DB.
                 await self._save_backfill_progress(room_id, next_token, "running", total)
 
-                # Terminal conditions
-                if not chunk:
-                    # Empty chunk: treat as exhausted.
+                # Terminal condition: the homeserver signals end-of-history by
+                # omitting the `end` token. An empty `chunk` is NOT terminal —
+                # Synapse can return chunk:[] with a valid `end` while paginating
+                # across sparse windows (state events, lazy backfill boundaries),
+                # so we must keep paging until `end` disappears. The
+                # `next_token == prev_token` clause guards against an infinite
+                # loop if the server keeps handing back the same token.
+                if not next_token or next_token == prev_token:
                     await self._save_backfill_progress(room_id, next_token, "exhausted", total)
-                    self.log.info(
-                        f"Backfill exhausted for {room_id}: {total} messages stored (empty chunk)"
-                    )
-                    return
-                if not next_token:
-                    await self._save_backfill_progress(room_id, None, "exhausted", total)
                     self.log.info(
                         f"Backfill exhausted for {room_id}: {total} messages stored"
                     )
@@ -2638,6 +2666,70 @@ class WebPublishBot(Plugin):
         html = render_thread_panel_fragment(root, comments, hs, self._base_url)
         return Response(
             text=html, content_type="text/html",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @web.get("/{alias}/older")
+    async def web_alias_older(self, req: Request) -> Response:
+        return await self._handle_older_fragment(
+            req, unquote(req.match_info["alias"]),
+        )
+
+    @web.get("/older")
+    async def web_alias_older_root(self, req: Request) -> Response:
+        return await self._handle_older_fragment(req, "/")
+
+    async def _handle_older_fragment(self, req: Request, alias: str) -> Response:
+        room_id = self._alias_to_room.get(alias)
+        if not room_id:
+            return Response(status=404, text="Room not found")
+        target_alias = self._redirect_aliases.get(alias)
+        if target_alias:
+            qs = f"?{req.query_string}" if req.query_string else ""
+            if target_alias == "/":
+                location = f"{self._base_url}/older{qs}"
+            else:
+                location = f"{self._base_url}/{target_alias}/older{qs}"
+            return Response(status=302, headers={"Location": location})
+
+        info = self._published[room_id]
+        if info["mode"] != "chat":
+            return Response(status=404, text="Load-older only available in chat mode")
+
+        try:
+            before = int(req.query.get("before", "0"))
+        except (TypeError, ValueError):
+            before = 0
+        if before <= 0:
+            return Response(text="", content_type="text/html",
+                            headers={"Cache-Control": "no-store"})
+
+        messages = await self._get_messages_before(
+            room_id, before, _CHAT_OLDER_BATCH,
+        )
+        if not messages:
+            return Response(text="", content_type="text/html",
+                            headers={"Cache-Control": "no-store"})
+
+        await self._enrich_reply_context(messages)
+        await self._apply_reactions_to_messages(room_id, messages)
+        eids = [m["event_id"] for m in messages]
+        comment_counts = await self._get_comment_counts(eids)
+        thread_participants = await self._get_thread_participants(eids, 6)
+        hs = self._homeserver_url()
+
+        chunks: list[str] = []
+        for m in messages:
+            eid = m["event_id"]
+            count = comment_counts.get(eid, 0)
+            indicator = render_thread_indicator_html(
+                eid, count, thread_participants.get(eid, []), hs, self._base_url,
+            ) if count else ""
+            chunks.append(render_message_html(
+                m, hs, self._base_url, thread_indicator_html=indicator,
+            ))
+        return Response(
+            text="\n".join(chunks), content_type="text/html",
             headers={"Cache-Control": "no-store"},
         )
 
