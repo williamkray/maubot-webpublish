@@ -1169,7 +1169,13 @@ _LEAFLET_INIT_SCRIPT = (
 )
 
 
-def _page_head(title: str, custom_css: str, extra_head: str = "", og_meta: str = "") -> str:
+def _page_head(
+    title: str,
+    custom_css: str,
+    extra_head: str = "",
+    og_meta: str = "",
+    head_html: str = "",
+) -> str:
     import_lines, override_lines = [], []
     for line in (custom_css or "").splitlines():
         (import_lines if line.strip().startswith("@import") else override_lines).append(line)
@@ -1179,10 +1185,15 @@ def _page_head(title: str, custom_css: str, extra_head: str = "", og_meta: str =
     user_style = f"<style>\n{user_css}\n</style>\n" if user_css else ""
     leaflet = f"{extra_head}\n" if extra_head else ""
     og = f"{og_meta}\n" if og_meta else ""
+    # Operator-supplied raw HTML injected verbatim (analytics / RUM snippets,
+    # extra meta tags). Placed as early as possible in <head> so instrumentation
+    # like Datadog RUM loads before page content.
+    injected_head = f"{head_html}\n" if head_html else ""
     return (
         f'<!DOCTYPE html>\n<html lang="en">\n<head>\n'
         f'<meta charset="utf-8">\n'
         f'<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f'{injected_head}'
         f'<title>{escape(title)}</title>\n'
         f'{og}'
         f'<style>\n{BASE_CSS}\n</style>\n'
@@ -1930,11 +1941,17 @@ def render_chat_page(
     thread_participants: dict[str, list[dict]] | None = None,
     pinned_banner_html: str = "",
     succession_banner_html: str = "",
+    head_html: str = "",
+    body_html: str = "",
 ) -> str:
     counts = comment_counts or {}
     parts = thread_participants or {}
     has_maps = _needs_leaflet(messages)
-    head = _page_head(room_name, custom_css, extra_head=_LEAFLET_HEAD_ASSETS if has_maps else "")
+    head = _page_head(
+        room_name, custom_css,
+        extra_head=_LEAFLET_HEAD_ASSETS if has_maps else "",
+        head_html=head_html,
+    )
     msg_chunks: list[str] = []
     for m in messages:
         eid = m["event_id"]
@@ -1965,6 +1982,7 @@ def render_chat_page(
         '&#x2B07; Jump to newest</button>'
     )
     succession_footer = f'{succession_banner_html}\n' if succession_banner_html else ''
+    injected_body = f'{body_html}\n' if body_html else ''
     return (
         f'{head}\n<body class="webpublish-chat-mode">\n'
         f'<header class="webpublish-header">\n'
@@ -1977,6 +1995,7 @@ def render_chat_page(
         f'<aside class="webpublish-thread-panel" id="thread-panel" hidden></aside>\n'
         f'{succession_footer}'
         f'{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n{load_older}\n{panel_script}\n{pinned_script}\n{scroll_script}\n'
+        f'{injected_body}'
         f'</body>\n</html>'
     )
 
@@ -2026,9 +2045,11 @@ def render_journal_landing(
     room_avatar_url: str = "",
     pinned_section_html: str = "",
     succession_banner_html: str = "",
+    head_html: str = "",
+    body_html: str = "",
 ) -> str:
     og = _og_meta_site(room_name, room_topic, encoded_alias, base_url, room_avatar_url, base_url) if base_url else ""
-    head = _page_head(room_name, custom_css, og_meta=og)
+    head = _page_head(room_name, custom_css, og_meta=og, head_html=head_html)
     topic_p = (
         f"  <p>{linkify_plaintext(room_topic, newlines_to_br=False)}</p>\n"
         f'  <button class="webpublish-topic-toggle" type="button" aria-expanded="false" hidden>Show more</button>'
@@ -2063,6 +2084,7 @@ def render_journal_landing(
     scroll_script = _scroll_header_script()
     avatar_img = _render_room_avatar_img(room_avatar_url, base_url)
     succession_footer = f'{succession_banner_html}\n' if succession_banner_html else ''
+    injected_body = f'{body_html}\n' if body_html else ''
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
@@ -2073,7 +2095,8 @@ def render_journal_landing(
         f'  <div class="webpublish-posts">\n{posts_html}\n  </div>\n'
         f'  {pag_html}\n'
         f'{feed_footer}'
-        f'</main>\n{succession_footer}{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{sse}\n{scroll_script}\n</body>\n</html>'
+        f'</main>\n{succession_footer}{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{sse}\n{scroll_script}\n'
+        f'{injected_body}</body>\n</html>'
     )
 
 
@@ -2087,12 +2110,18 @@ def render_journal_post(
     homeserver_url: str,
     proxy_base_url: str = "",
     room_avatar_url: str = "",
+    head_html: str = "",
+    body_html: str = "",
 ) -> str:
     title = (post.get("body") or "").split("\n", 1)[0][:80]
     has_maps = _needs_leaflet([post] + comments)
     og = _og_meta_post(post, room_name, encoded_alias, proxy_base_url, homeserver_url, room_avatar_url) if proxy_base_url else ""
-    head = _page_head(f"{title} - {room_name}", custom_css, extra_head=_LEAFLET_HEAD_ASSETS if has_maps else "", og_meta=og)
-    body_html = render_body(post, homeserver_url, proxy_base_url, journal=True)
+    head = _page_head(
+        f"{title} - {room_name}", custom_css,
+        extra_head=_LEAFLET_HEAD_ASSETS if has_maps else "",
+        og_meta=og, head_html=head_html,
+    )
+    post_body_html = render_body(post, homeserver_url, proxy_base_url, journal=True)
     author = escape(post.get("sender_name") or post["sender"])
     date = format_date(post["timestamp"])
     edited = " (edited)" if post.get("edited") else ""
@@ -2127,6 +2156,7 @@ def render_journal_post(
         f"  <p>{linkify_plaintext(room_topic, newlines_to_br=False)}</p>\n"
         f'  <button class="webpublish-topic-toggle" type="button" aria-expanded="false" hidden>Show more</button>'
     ) if room_topic else ""
+    injected_body = f'{body_html}\n' if body_html else ''
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
@@ -2140,7 +2170,7 @@ def render_journal_post(
         f'      <span>{date}{edited}</span>\n'
         f'    </div>\n'
         f'{tags_section}\n'
-        f'    <div class="webpublish-post-body">{body_html}</div>\n'
+        f'    <div class="webpublish-post-body">{post_body_html}</div>\n'
         f'{post_reactions_section}'
         f'  </article>\n'
         f'  <section class="webpublish-comments">\n'
@@ -2150,7 +2180,8 @@ def render_journal_post(
         f'    </div>\n'
         f'    <div id="comments">\n{comments_html}\n    </div>\n'
         f'  </section>\n'
-        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n{scroll_script}\n</body>\n</html>'
+        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}{leaflet_init}\n{sse}\n{scroll_script}\n'
+        f'{injected_body}</body>\n</html>'
     )
 
 
@@ -2216,9 +2247,11 @@ def render_tag_index_page(
     custom_css: str,
     base_url: str = "",
     room_avatar_url: str = "",
+    head_html: str = "",
+    body_html: str = "",
 ) -> str:
     og = _og_meta_site(room_name, "", encoded_alias, base_url, room_avatar_url, base_url) if base_url else ""
-    head = _page_head(f"Tags - {room_name}", custom_css, og_meta=og)
+    head = _page_head(f"Tags - {room_name}", custom_css, og_meta=og, head_html=head_html)
     back_href = "./" if not encoded_alias else f"../{encoded_alias}"
 
     tag_items = []
@@ -2232,6 +2265,7 @@ def render_tag_index_page(
 
     scroll_script = _scroll_header_script()
     avatar_img = _render_room_avatar_img(room_avatar_url, base_url)
+    injected_body = f'{body_html}\n' if body_html else ''
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
@@ -2241,7 +2275,7 @@ def render_tag_index_page(
         f'  <a class="webpublish-back-link" href="{back_href}">&larr; back to posts</a>\n'
         f'  <h2 class="webpublish-tag-header">All Tags</h2>\n'
         f'  <ul class="webpublish-tag-list">\n    {tags_html}\n  </ul>\n'
-        f'</main>\n{scroll_script}\n</body>\n</html>'
+        f'</main>\n{scroll_script}\n{injected_body}</body>\n</html>'
     )
 
 
@@ -2256,9 +2290,11 @@ def render_tag_filter_page(
     comment_counts: dict[str, int],
     base_url: str = "",
     room_avatar_url: str = "",
+    head_html: str = "",
+    body_html: str = "",
 ) -> str:
     og = _og_meta_site(f"#{tag} - {room_name}", "", encoded_alias, base_url, room_avatar_url, base_url) if base_url else ""
-    head = _page_head(f"#{tag} - {room_name}", custom_css, og_meta=og)
+    head = _page_head(f"#{tag} - {room_name}", custom_css, og_meta=og, head_html=head_html)
     back_href = "../" if not encoded_alias else f"../../{encoded_alias}"
 
     posts_parts = []
@@ -2289,6 +2325,7 @@ def render_tag_filter_page(
 
     scroll_script = _scroll_header_script()
     avatar_img = _render_room_avatar_img(room_avatar_url, base_url)
+    injected_body = f'{body_html}\n' if body_html else ''
     return (
         f'{head}\n<body>\n'
         f'<header class="webpublish-header">\n'
@@ -2300,5 +2337,5 @@ def render_tag_filter_page(
         f'  <div class="webpublish-posts">\n{posts_html}\n  </div>\n'
         f'  {pag_html}\n'
         f'{feed_footer}'
-        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{scroll_script}\n</body>\n</html>'
+        f'</main>\n{_LOCALIZE_TIMESTAMPS_SCRIPT}\n{scroll_script}\n{injected_body}</body>\n</html>'
     )

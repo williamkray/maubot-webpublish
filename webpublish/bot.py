@@ -82,6 +82,8 @@ OVERRIDABLE_CONFIG: dict[str, Callable[[str], Any]] = {
     "journal_enforce_messages": _parse_bool,
     "chat_author_pl": int,
     "chat_enforce_messages": _parse_bool,
+    "head_html": str,
+    "body_html": str,
 }
 
 
@@ -98,6 +100,8 @@ class Config(BaseProxyConfig):
         helper.copy("journal_enforce_messages")
         helper.copy("chat_author_pl")
         helper.copy("chat_enforce_messages")
+        helper.copy("head_html")
+        helper.copy("body_html")
 
 
 class WebPublishBot(Plugin):
@@ -2453,7 +2457,12 @@ class WebPublishBot(Plugin):
         room_avatar_url = await self._get_room_avatar(room_id)
         tags = await self._get_tag_counts(room_id)
         encoded = "" if alias == "/" else alias
-        html = render_tag_index_page(room_name, tags, encoded, self._get_room_config(room_id, "css"), self._base_url, room_avatar_url=room_avatar_url)
+        html = render_tag_index_page(
+            room_name, tags, encoded, self._get_room_config(room_id, "css"),
+            self._base_url, room_avatar_url=room_avatar_url,
+            head_html=self._get_room_config(room_id, "head_html"),
+            body_html=self._get_room_config(room_id, "body_html"),
+        )
         return Response(text=html, content_type="text/html",
                         headers={"Cache-Control": _HTML_CACHE_CONTROL})
 
@@ -2489,6 +2498,8 @@ class WebPublishBot(Plugin):
             room_name, tag.lower(), posts, encoded, page, total_pages,
             self._get_room_config(room_id, "css"), counts, self._base_url,
             room_avatar_url=room_avatar_url,
+            head_html=self._get_room_config(room_id, "head_html"),
+            body_html=self._get_room_config(room_id, "body_html"),
         )
         return Response(text=html, content_type="text/html",
                         headers={"Cache-Control": _HTML_CACHE_CONTROL})
@@ -2516,6 +2527,8 @@ class WebPublishBot(Plugin):
         room_avatar_url = await self._get_room_avatar(room_id)
         hs = self._homeserver_url()
         css = self._get_room_config(room_id, "css")
+        head_html = self._get_room_config(room_id, "head_html")
+        body_html = self._get_room_config(room_id, "body_html")
         encoded = "" if alias == "/" else alias
 
         if info["mode"] == "chat":
@@ -2538,6 +2551,8 @@ class WebPublishBot(Plugin):
                 thread_participants=thread_participants,
                 pinned_banner_html=pinned_banner,
                 succession_banner_html=self._render_succession_banner_for_room(room_id),
+                head_html=head_html,
+                body_html=body_html,
             )
         else:
             page = int(req.query.get("page", "1"))
@@ -2575,6 +2590,8 @@ class WebPublishBot(Plugin):
                 room_avatar_url=room_avatar_url,
                 pinned_section_html=pinned_section_html,
                 succession_banner_html=self._render_succession_banner_for_room(room_id),
+                head_html=head_html,
+                body_html=body_html,
             )
 
         return Response(text=html, content_type="text/html",
@@ -2620,6 +2637,8 @@ class WebPublishBot(Plugin):
         html = render_journal_post(
             room_name, room_topic, post, comments, encoded, css, hs, self._base_url,
             room_avatar_url=room_avatar_url,
+            head_html=self._get_room_config(room_id, "head_html"),
+            body_html=self._get_room_config(room_id, "body_html"),
         )
         return Response(text=html, content_type="text/html",
                         headers={"Cache-Control": _HTML_CACHE_CONTROL})

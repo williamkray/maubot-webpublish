@@ -121,7 +121,9 @@ Always add `self.log.debug(f"...: {e}")` in the except clause so failures are vi
 
 ### Config keys (`base-config.yaml`)
 
-`css`, `pagination` (int), `max_backfill` (int — `<= 0` means unlimited resumable crawl), `backfill_batch_size` (int, clamped to `[1, 1000]`, default 50), `min_power_level` (int), `base_url` (str, empty = auto-detect), `journal_author_pl` (int), `journal_emoji_publish` (bool), `journal_enforce_messages` (bool), `chat_author_pl` (int), `chat_enforce_messages` (bool).
+`css`, `pagination` (int), `max_backfill` (int — `<= 0` means unlimited resumable crawl), `backfill_batch_size` (int, clamped to `[1, 1000]`, default 50), `min_power_level` (int), `base_url` (str, empty = auto-detect), `journal_author_pl` (int), `journal_emoji_publish` (bool), `journal_enforce_messages` (bool), `chat_author_pl` (int), `chat_enforce_messages` (bool), `head_html` (str), `body_html` (str).
+
+`head_html` / `body_html` are operator-supplied raw HTML injected **verbatim, unescaped** into every published HTML page — `head_html` early in `<head>` (via `_page_head`), `body_html` immediately before `</body>`. Intended for analytics/RUM snippets (Datadog RUM example is in `base-config.yaml`), extra meta tags, or deferred widgets. Both are in `OVERRIDABLE_CONFIG` (per-room override via the `org.jobmachine.webpublish.config` state event, `str` parser). Injection covers the five full HTML pages (chat, journal landing, journal post, tag index, tag filter) — **not** SSE/older/thread fragments and **not** the Atom feed (`render_atom_feed`).
 
 `chat_enforce_messages` mirrors `journal_enforce_messages`: when true, top-level chat messages from users below `chat_author_pl` are redacted (threaded replies bypass). Enforcement is live-only — backfill does not retroactively redact, matching the journal precedent.
 

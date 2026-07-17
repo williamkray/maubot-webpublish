@@ -38,3 +38,25 @@ chat_enforce_messages: false
 # Base URL for the web interface (leave empty to auto-detect from maubot)
 # Example: https://your.maubot.host/_matrix/maubot/plugin/your-instance-id
 base_url: ""
+# Optional raw HTML injected verbatim into every published page's <head>, as
+# early as possible. Use for analytics / RUM snippets that must load before page
+# content, or extra meta tags. Leave empty to disable. Can be overridden per-room
+# via the room's org.jobmachine.webpublish.config state event.
+# Example — Datadog RUM (v7 CDN async snippet); fill in your own ids/token/site:
+#   head_html: |
+#     <script>
+#       (function(h,o,u,n,d){h=h[d]=h[d]||{q:[],onReady:function(c){h.q.push(c)}}
+#       d=o.createElement(u);d.async=1;d.src=n,d.crossOrigin=''
+#       n=o.getElementsByTagName(u)[0];n.parentNode.insertBefore(d,n)})
+#       (window,document,'script','https://www.datadoghq-browser-agent.com/us1/v7/datadog-rum.js','DD_RUM')
+#       window.DD_RUM.onReady(function(){window.DD_RUM.init({
+#         applicationId:'YOUR_APP_ID', clientToken:'YOUR_CLIENT_TOKEN',
+#         site:'datadoghq.com', service:'webpublish',
+#         sessionSampleRate:100, sessionReplaySampleRate:0
+#       })})
+#     </script>
+head_html: ""
+# Optional raw HTML injected verbatim just before </body> on every published
+# page. Use for deferred scripts or widgets. Leave empty to disable. Also
+# overridable per-room via the config state event.
+body_html: ""
